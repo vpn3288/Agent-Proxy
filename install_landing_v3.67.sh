@@ -118,7 +118,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 # - 修复 acme.sh 首次安装下载/执行缺失，恢复证书申请链路
 # - 将 INPUT 链清理改为行号删除，避免 save/restore 重放旧规则
 # - 修正 nginx worker_connections 注释覆盖逻辑，防止升级标签堆叠
-readonly VERSION="v3.66"
+readonly VERSION="v3.67"
 # v2.17: Gemini审计修复·gRPC fallback使用纯ALPN匹配
 # v2.15: 初始稳定版本
 
@@ -866,7 +866,10 @@ issue_certificate(){
 
   # [R21 Fix] Validate CF token has Zone:DNS:Edit permission before wasting ACME attempts
   local _zone_id
-  _zone_id=$(curl -fsSL --connect-timeout 5 --max-time 10     -H "Authorization: Bearer $cf_token"     "https://api.cloudflare.com/client/v4/zones?name=${domain#*.}"     2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['result'][0]['id'] if d.get('result') else '')" 2>/dev/null) || true
+  _zone_id=$(curl -fsSL --connect-timeout 5 --max-time 10 \
+    -H "Authorization: Bearer $cf_token" \
+    "https://api.cloudflare.com/client/v4/zones?name=${domain#*.}" \
+    2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['result'][0]['id'] if d.get('result') else '')" 2>/dev/null) || true
   if [[ -z "$_zone_id" ]]; then
     die "Cloudflare API Token 验证失败（无法获取 Zone ID），请检查 Token 权限（需要 Zone:DNS:Edit）"
   fi

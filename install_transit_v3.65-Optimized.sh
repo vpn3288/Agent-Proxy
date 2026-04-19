@@ -45,7 +45,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 # - 将 INPUT 链清理改为行号删除，避免 save/restore 重放旧规则
 # - 修正 worker_connections 注释覆盖逻辑，防止升级标签堆叠
 # - 保持 SNI 盲传与双栈防火墙结构不变
-readonly VERSION="v3.64-Optimized"
+readonly VERSION="v3.65-Optimized"
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
@@ -75,7 +75,7 @@ readonly UPDATE_WARN_FILE="/var/run/transit-manager.update.warn"
 
 # [F1] Startup stale snapshot sweep — SIGKILL leaves .snap-recover files that EXIT trap cannot clean
 find /etc/transit_manager /etc/nginx /etc/systemd/system \
-  -maxdepth 5 -name '.snap-recover.*' -mtime +1 -delete 2>/dev/null || true
+  -maxdepth 5 -type f -name '.snap-recover.*' -mtime +1 -delete 2>/dev/null || true
 
 # BUG-02: 中断时清理 atomic_write 残留的临时文件及事务快照
 # v2.32 Gemini: 统一当次全清——操作锁保证同一时刻只有一个事务，快照不需要跨日保留
