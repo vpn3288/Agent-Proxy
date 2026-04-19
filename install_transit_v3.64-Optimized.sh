@@ -45,7 +45,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 # - 将 INPUT 链清理改为行号删除，避免 save/restore 重放旧规则
 # - 修正 worker_connections 注释覆盖逻辑，防止升级标签堆叠
 # - 保持 SNI 盲传与双栈防火墙结构不变
-readonly VERSION="v3.63-Optimized"
+readonly VERSION="v3.64-Optimized"
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
@@ -1333,7 +1333,6 @@ generate_nodes(){
     _tmp=$(mktemp) || return 1
     printf '%s\n' "$transit_ip" "$dom" "$uuid" "$pwd" "$pfx" > "$_tmp"
     sub_b64=$(python3 - "$_tmp" 2>&1) || { _sub_err="$sub_b64"; sub_b64=""; }
-    rm -f "$_tmp"
 
     python3 - "$_tmp" >/dev/null 2>&1 <<'PYGEN'
 import base64, urllib.parse, sys
@@ -1351,6 +1350,7 @@ uris = [
 ]
 print(base64.b64encode('\n'.join(uris).encode()).decode())
 PYGEN
+    rm -f "$_tmp"
 
     if [[ -n "$sub_b64" ]]; then
       echo -e "  ${BOLD}Base64 订阅（粘贴到客户端「添加订阅」）:${NC}"
