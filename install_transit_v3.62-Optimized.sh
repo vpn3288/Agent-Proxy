@@ -1666,8 +1666,8 @@ show_status(){
       || { echo -e "  ${RED}INVALID DROP:    ✗ 规则缺失（执行 --import 或重装以修复）${NC}"; _ok=0; }
     # proxy_timeout 文件态 vs nginx 运行态对比
     local _rscript_pt _live_pt
-    _rscript_pt=$(grep -oP 'proxy_timeout\s+\K[0-9]+' "$NGINX_STREAM_CONF" 2>/dev/null | head -1 || echo "")
-    _live_pt=$(nginx -T 2>/dev/null | grep -oP 'proxy_timeout\s+\K[0-9]+' | head -1 || echo "")
+    _rscript_pt=$(grep -oE 'proxy_timeout[[:space:]]+[0-9]+' "$NGINX_STREAM_CONF" 2>/dev/null | awk '{print $2}' | head -1 || echo "")
+    _live_pt=$(nginx -T 2>/dev/null | grep -oE 'proxy_timeout[[:space:]]+[0-9]+' | awk '{print $2}' | head -1 || echo "")
     if [[ -n "$_rscript_pt" && "$_rscript_pt" != "$_live_pt" ]]; then
       # v2.40 GPT #5: --status 是只读巡检，不执行写操作；漂移只报红，修复用独立命令
       echo -e "  ${RED}恢复脚本存在:    ✗ proxy_timeout 与运行态不一致（需手动修复）${NC}"; _ok=0
