@@ -1933,12 +1933,12 @@ PYIP
     _fw_skip=1
   fi
 
-  local USE_CF_TOKEN="$CF_TOKEN"
-  if [[ -z "$USE_CF_TOKEN" ]]; then
+  local USE_CF_TOKEN=""
+  if [[ -z "$USE_CF_TOKEN" || "$USE_CF_TOKEN" == "***" ]]; then
     read -rp "Cloudflare API Token（Zone:DNS:Edit）: " USE_CF_TOKEN
     validate_cf_token "$USE_CF_TOKEN"
-    CF_TOKEN="$USE_CF_TOKEN"
   fi
+  CF_TOKEN="$USE_CF_TOKEN"
 
   # v2.32: 所有用户输入已收集，加锁后才开始写操作
   _acquire_lock
