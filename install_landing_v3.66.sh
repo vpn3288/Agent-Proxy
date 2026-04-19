@@ -2111,6 +2111,8 @@ delete_node(){
   local DEL_CONF="${node_files[$idx]}"
   local DEL_DOMAIN; DEL_DOMAIN=$(grep '^DOMAIN='     "$DEL_CONF" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}')
   local DEL_TRANSIT; DEL_TRANSIT=$(grep '^TRANSIT_IP=' "$DEL_CONF" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}')
+  [[ -n "$DEL_DOMAIN" ]] || die "节点配置缺少 DOMAIN 字段"
+  validate_domain "$DEL_DOMAIN"
 
   read -rp "确认删除 ${DEL_DOMAIN}（中转: ${DEL_TRANSIT}）？[y/N]: " CONFIRM
   [[ "$CONFIRM" =~ ^[Yy]$ ]] || { info "已取消"; return; }

@@ -1170,8 +1170,16 @@ _atomic_apply_route(){
   trap '_route_rollback; _restore_prev_route_traps; exit 1' INT TERM ERR
   local domain="$1" ip="$2" port="$3"
   local uuid="${4:-}" pwd="${5:-}" pfx="${6:-}"
-  # [R3 Fix] Validate uuid/pwd/pfx are non-empty before using in route
-  [[ -n "$uuid" && -n "$pwd" && -n "$pfx" ]] || die "Token 中 uuid/pwd/pfx 字段为空（格式损坏），拒绝导入"
+  # [R3 Fix] Validate uuid/pwd/pfx are non-empty for token-import mode
+  # v3.64: Manual add_landing_route passes empty strings — skip validation, allow partial route
+  #        Token import path (import_token) always provides all 6 params so this still validates
+  if [[ -z "$uuid" || -z "$pwd" || -z "$pfx" ]]; then
+    : # manual mode — uuid/pwd/pfx may be absent, only write routing (no subscription)
+  else
+    [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+      || die "Token 中 uuid 格式非法（需为标准 UUID 格式）"
+    [[ ${#pwd} -ge 16 ]] || die "Token 中密码过短（需 ≥16 字符）"
+  fi
   local safe; safe=$(domain_to_safe "$domain")
   [[ -n "$safe" ]] || die "域名 safe 转换后为空: ${domain}"
 
@@ -1208,9 +1216,12 @@ _atomic_apply_route(){
   local _map_key; _map_key=$(nginx_domain_str "$domain")
   [[ -n "$_map_key" && ${#_map_key} -le 200 ]] \
     || { rm -f "$tmp_map" 2>/dev/null; die "域名过滤后为空或超长，拒绝写入 map: ${domain}"; }
-  printf '    %s    %s:%s;\n' "$_map_key" "$(nginx_ip_str "$ip")" "$port" > "$tmp_map"
-  chmod 600 "$tmp_map"
-  mv -f "$tmp_map" "$map_target"
+  printf '    %s    %s:%s;\n' "$_map_key" "$(nginx_ip_str "$ip")" "$port" > "$tmp_map" \
+    || { rm -f "$tmp_map" 2>/dev/null; die "写入 map 临时文件失败（磁盘满？）"; }
+  chmod 600 "$tmp_map" \
+    || { rm -f "$tmp_map" 2>/dev/null; die "chmod tmp_map failed"; }
+  mv -f "$tmp_map" "$map_target" \
+    || { rm -f "$tmp_map" 2>/dev/null; die "atomic mv tmp_map → $map_target failed"; }
   chmod 600 "$map_target" 2>/dev/null || true
 
   local _prev_route_err_trap _prev_route_int_trap _prev_route_term_trap
@@ -1252,8 +1263,10 @@ _atomic_apply_route(){
   local tmp_meta; tmp_meta=$(mktemp "${CONF_DIR}/.snap-recover.XXXXXX") \
     || die "mktemp tmp_meta failed"
   printf 'DOMAIN=%s\nTRANSIT_IP=%s\nPORT=%s\nUUID=%s\nPWD=%s\nPFX=%s\nCREATED=%s\n' \
-    "$domain" "$ip" "$port" "$uuid" "$pwd" "$pfx" "$(date +%Y%m%d_%H%M%S)" > "$tmp_meta"
-  chmod 600 "$tmp_meta"
+    "$domain" "$ip" "$port" "$uuid" "$pwd" "$pfx" "$(date +%Y%m%d_%H%M%S)" > "$tmp_meta" \
+    || { rm -f "$tmp_meta" 2>/dev/null; die "写入 meta 临时文件失败（磁盘满？）"; }
+  chmod 600 "$tmp_meta" \
+    || { rm -f "$tmp_meta" 2>/dev/null; die "chmod tmp_meta failed"; }
   if ! mv -f "$tmp_meta" "$meta_target"; then
     rm -f "$tmp_meta" 2>/dev/null || true
     _route_rollback; _restore_prev_route_traps
@@ -1554,7 +1567,8 @@ add_landing_route(){
   fi
 
   # v2.35 Grok: _atomic_apply_route 内部自管快照，外部 _old_bak 仍保留供 SIGINT 清理
-  _atomic_apply_route "$LANDING_DOMAIN" "$LANDING_IP" "$LANDING_PORT_IN"
+  # v3.64: 手动模式不传 uuid/pwd/pfx，_atomic_apply_route 允许空值（仅写路由，无节点订阅）
+  _atomic_apply_route "$LANDING_DOMAIN" "$LANDING_IP" "$LANDING_PORT_IN" "" "" ""
   rm -f "$_old_bak" 2>/dev/null || true
   _release_lock
   success "路由规则已生效: SNI=${LANDING_DOMAIN} → ${LANDING_IP}:${LANDING_PORT_IN}"
@@ -2018,8 +2032,8 @@ main(){
   _check_update >"$UPDATE_WARN_FILE" 2>&1 &
   UPDATE_CHECK_PID=$!
   _prune_orphan_stream_maps
+  local _durable_transit=0
   if [[ ! -f "$INSTALLED_FLAG" ]]; then
-    local _durable_transit=0
     if grep -q "$STREAM_INCLUDE_MARKER" "$NGINX_MAIN_CONF" 2>/dev/null &&        find "$CONF_DIR" -maxdepth 1 -type f -name "*.meta" 2>/dev/null | grep -q .; then
       if _meta_drift_detect; then
         warn "[reconcile] durable set has meta/map drift — leaving .installed absent"
