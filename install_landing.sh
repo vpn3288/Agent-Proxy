@@ -937,8 +937,11 @@ issue_certificate(){
     fi
     # [CRITICAL-acme Fix] HOME must point to the extracted source dir so the installer's
     # internal "cp acme.sh" resolves to ${_acme_src_dir}/acme.sh (not ${ACME_HOME}/.acme.sh).
-    env noprofile=1 HOME="${_acme_src_dir}" sh "${_acme_src_dir}/acme.sh" --home "${ACME_HOME}" --install \
-      || die "acme.sh 安装失败"
+    (
+      cd "${_acme_src_dir}" \
+        && env noprofile=1 sh "${_acme_src_dir}/acme.sh" --home "${ACME_HOME}" --install \
+      && mv "${_acme_src_dir}/acme.sh.env" "${ACME_HOME}/" 2>/dev/null || true
+    ) || die "acme.sh 安装失败"
     rm -rf "${_acme_tmp_home}" 2>/dev/null || true
     [[ -f "${ACME_HOME}/acme.sh" ]]       || die "acme.sh 安装后在 ${ACME_HOME} 未找到 acme.sh，请检查安装器是否支持 --home"
     [[ -f "${ACME_HOME}/dnsapi/dns_cf.sh" ]]       || die "acme.sh 安装后缺少 dns_cf.sh 插件，请检查: ls ${ACME_HOME}/dnsapi/"
