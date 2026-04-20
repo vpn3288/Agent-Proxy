@@ -833,10 +833,16 @@ if ! /bin/systemctl is-active --quiet xray-landing.service 2>/dev/null; then
 fi
 
 # 先修权限（依赖 reload 成功前确保权限正确）
-chown -R root:xray-landing "\$CERT_DIR" || true
-chmod 750 "\$CERT_DIR" || true
-chmod 644 "\$CERT_DIR/cert.pem" "\$CERT_DIR/fullchain.pem" || true
-chmod 640 "\$CERT_DIR/key.pem" || true
+# [REVIEWER-6 Fix] Die on chown failure — masked error leaves certs owned by wrong user
+chown -R root:xray-landing "\$CERT_DIR" \
+  || { logger -t acme-xray-landing "ERROR: chown failed for \$CERT_DIR"; exit 1; }
+# [REVIEWER-6 Fix] Die on chmod failure — masked error leaves key.pem world-readable
+chmod 750 "\$CERT_DIR" \
+  || { logger -t acme-xray-landing "ERROR: chmod 750 failed for \$CERT_DIR"; exit 1; }
+chmod 640 "\$CERT_DIR/cert.pem" "\$CERT_DIR/fullchain.pem" \
+  || { logger -t acme-xray-landing "ERROR: chmod 640 failed for certs"; exit 1; }
+chmod 640 "\$CERT_DIR/key.pem" \
+  || { logger -t acme-xray-landing "ERROR: chmod 640 failed for key.pem — key may be exposed"; exit 1; }
 
 if openssl x509 -checkend 86400 -noout -in "\${CERT_DIR}/fullchain.pem" 2>/dev/null; then
   # 证书有效：Xray 需要 restart 加载新证书（reload 对 Xray 无效），使用 restart 避免 StartLimitBurst 消耗
@@ -1395,7 +1401,7 @@ User=@@LANDING_USER@@
 NoNewPrivileges=true
 ExecStartPre=/bin/sh -c 'test -f @@LANDING_CONF@@ || { echo "config.json missing"; exit 1; }'
 ExecStartPre=/bin/sh -c 'python3 -c "import json,sys; json.load(open(sys.argv[1]))" @@LANDING_CONF@@ 2>/dev/null || { echo "config.json invalid JSON"; exit 1; }'
-ExecStartPre=/bin/sh -c 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); vision=[i for i in d[\"inbounds\"] if \"flow\" in str(i.get(\"settings\",{}).get(\"clients\",[{}])[0])]; sys.exit(1 if any(\"mux\" in str(i) for i in vision) else 0)" @@LANDING_CONF@@ 2>/dev/null || { echo "Vision inbound has mux enabled (unsupported with flow=xtls-rprx-vision)"; exit 1; }'
+ExecStartPre=/bin/sh -c 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); vision=[i for i in d[\"inbounds\"] if \"flow\" in str(i.get(\"settings\",{}).get(\"clients\",[{}])[0])]; sys.exit(1 if any(i.get(\"settings\",{}).get(\"mux\",{}).get(\"enabled\") for i in vision) else 0)" @@LANDING_CONF@@ 2>/dev/null || { echo "Vision inbound has mux enabled (unsupported with flow=xtls-rprx-vision)"; exit 1; }'
 @@CAP_LINE@@
 @@CAP_BOUND@@
 ExecStart=@@LANDING_BIN@@ run -config @@LANDING_CONF@@

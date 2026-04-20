@@ -932,7 +932,11 @@ trap '_fw_transit_rollback; exit 130' INT TERM
   iptables -w 2 -E "$FW_TMP" "$FW_CHAIN" || {
     _fw_transit_rollback; _restore_prev_traps; die "Chain rename failed（FW_TMP→FW_CHAIN），防火墙交换失败"
   }
-  iptables -w 2 -I INPUT 1 -m comment --comment "transit-manager-rule" -j "$FW_CHAIN"
+  # [REVIEWER-7 Fix] REMOVED duplicate INPUT insertion: line 935 was redundant.
+  # After the atomic swap above, FW_CHAIN is already at INPUT position 1
+  # (the swap inserted it there; rename doesn't change position).
+  # Line 935 inserted a second jump to the same chain, creating a duplicate.
+  # Position check below verifies FW_CHAIN is at position 1.
   # [R5 Fix] Verify INPUT position 1 — warn (not die) since Docker/fail2ban also use position 1
   local _actual_pos
   _actual_pos=$(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_CHAIN" '$2==c {print $1; exit}')
@@ -971,7 +975,7 @@ trap '_fw_transit_rollback; exit 130' INT TERM
       _bulldoze_input_refs6_t "$FW_CHAIN6"
       ip6tables -w 2 -F "$FW_CHAIN6" 2>/dev/null || true; ip6tables -w 2 -X "$FW_CHAIN6" 2>/dev/null || true
 ip6tables -w 2 -E "$FW_TMP6" "$FW_CHAIN6" || { _fw_transit_rollback; _restore_prev_traps; die "IPv6 chain rename failed"; }
-ip6tables -w 2 -I INPUT 1 -m comment --comment "transit-manager-v6-jump" -j "$FW_CHAIN6"
+# [REVIEWER-7 Fix] REMOVED duplicate INPUT insertion for IPv6 (same as line 935 fix)
       local _n
       mapfile -t _n < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_TMP6" '$2==c {print $1}' | sort -rn)
       for _n in "${_n[@]}"; do ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
@@ -1754,7 +1758,10 @@ purge_all(){
     fi
   else
     warn "nginx -t 失败（配置已删除），尝试直接重启..."
-    systemctl restart nginx 2>/dev/null || warn "nginx 重启失败，请手动处理"
+    if ! systemctl restart nginx 2>/dev/null; then
+      error "nginx 重启失败！请手动修复 /etc/nginx/nginx.conf 后执行: systemctl start nginx"
+      die "卸载中止：nginx 配置损坏，请手动修复"
+    fi
   fi
 
   rm -f "/etc/systemd/system/nginx.service.d/transit-manager-override.conf" 2>/dev/null || true
