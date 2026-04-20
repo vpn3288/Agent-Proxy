@@ -559,39 +559,11 @@ _tune_nginx_worker_connections(){
     die "nginx.conf 配置验证失败，原始配置已还原; 请检查 ${NGINX_MAIN_CONF}"
   fi
   rm -f "$_mc_bak" 2>/dev/null || true
-  local override_dir="/etc/systemd/system/nginx.service.d"
-  mkdir -p "$override_dir"
-  # [v2.8 GPT-Doc2-🟠] LimitNOFILE must equal _fd_max (dynamic); always rewrite so a
-  # re-run on different-RAM hardware updates the drop-in to the correct value.
-  # [v2.9] Use _tune_fd (same formula, recomputed above) for both worker_rlimit_nofile and
-  # the drop-in so the nginx.conf directive and the service cap are always identical.
-  local _ov="${override_dir}/transit-manager-override.conf"
-  atomic_write "$_ov" 644 root:root <<SVCOV
-[Unit]
-# [v2.9 Architect-🟠] Widened to 600s/10 — installer restarts nginx after rewriting the
-# drop-in; 300s/5 was tight enough to trip on a short maintenance burst.
-StartLimitIntervalSec=600
-StartLimitBurst=10
-
-[Service]
-LimitNOFILE=${_tune_fd}
-TasksMax=infinity
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-UMask=0027
-# Gemini: nginx 自管日志，systemd journal 无需重复收集（防低配 VPS 磁盘撑爆）
-StandardOutput=null
-StandardError=null
-SVCOV
-  systemctl daemon-reload \
-    || die "systemctl daemon-reload failed — drop-in limits will not apply (nginx may hit FD limit under load)"
-  if systemctl is-active --quiet nginx 2>/dev/null; then
-    systemctl reload nginx 2>/dev/null \
-      || die "Nginx reload 失败（配置已修改但未生效）— 运行态与文件态分裂，请执行: systemctl restart nginx"
-  fi
-  success "Nginx worker_connections=${_wc_val} / worker_rlimit_nofile=${_tune_fd} (dynamic)"
+  # [CRITICAL-3 Fix] Nginx drop-in removed: ProtectSystem=strict + ProtectHome=true causes
+  # systemctl start nginx to fail on some Debian 12 images even with minimal [Service] overrides.
+  # nginx works correctly with default systemd unit. worker_rlimit_nofile is set via nginx.conf
+  # directive (see above sed mutation) so the FD cap is still enforced without the drop-in.
+  success "Nginx worker_connections=${_wc_val} / worker_rlimit_nofile=${_tune_fd} (via nginx.conf)"
 }
 
 write_logrotate(){
@@ -1762,10 +1734,8 @@ purge_all(){
     fi
   fi
 
-  rm -f "/etc/systemd/system/nginx.service.d/transit-manager-override.conf" 2>/dev/null || true
-  rmdir "/etc/systemd/system/nginx.service.d" 2>/dev/null || true
-  systemctl daemon-reload 2>/dev/null || true
   rm -f "${NGINX_MAIN_CONF}.transit.bak_"* 2>/dev/null || true
+  # [CRITICAL-3 Fix] Drop-in no longer created — removed cleanup
 
   # [v2.15.1] purge_all: use bulldozer to remove ALL INPUT references to FW_CHAIN regardless
   # of comment text, then flush and delete. Old comment-based while loops missed rules with
