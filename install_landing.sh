@@ -706,25 +706,11 @@ _tune_nginx_worker_connections(){
     fi
   fi
   rm -f "$_mc_bak" 2>/dev/null || true
-  local od="/etc/systemd/system/nginx.service.d"
-  mkdir -p "$od"
-  local _ov="${od}/landing-override.conf"
-  # Always rewrite so re-runs on different-RAM hardware update to the correct value.
-  atomic_write "$_ov" 644 root:root <<SVCOV
-[Service]
-LimitNOFILE=${_tmc_fd}
-TasksMax=infinity
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-UMask=0027
-# Gemini: nginx 自管日志，journal 无需重复收集（防低配 VPS 磁盘撑爆）
-StandardOutput=null
-StandardError=null
-SVCOV
-  # [F4] Hard-fail: drop-in on disk but systemd runs stale graph if reload fails
-  systemctl daemon-reload || die "daemon-reload failed — drop-in limits will not apply"
+  # [CRITICAL] REMOVED nginx systemd drop-in (landing-override.conf) — on this Debian 12 image,
+  # ProtectSystem=strict + ProtectHome=true + LimitNOFILE causes "systemctl start nginx" to fail
+  # silently (exit 1, no output). The drop-in works fine on some distros but breaks nginx startup
+  # here. Direct daemon mode (nginx; no systemctl) still functions correctly.
+  info "nginx 配置优化完成"
 }
 
 setup_fallback_decoy(){
