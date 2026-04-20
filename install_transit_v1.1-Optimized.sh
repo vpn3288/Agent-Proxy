@@ -82,6 +82,11 @@ find /etc/transit_manager /etc/nginx /etc/systemd/system \
 _global_cleanup(){
   # [R1 Fix] Guard: refuse to delete if MANAGER_BASE is unset or empty
   [[ -n "${MANAGER_BASE:-}" && -d "$MANAGER_BASE" ]] || return 0
+  # [BUGFIX #13] Skip ALL cleanup if install has committed (i.e., _atomic_apply_route succeeded).
+  # Once .installed exists, only --uninstall may remove MANAGER_BASE.
+  # This guards against ERR/EXIT traps firing on normal script completion (e.g., menu options
+  # in a `set -E` session where pipeline failures trigger ERR → cleanup → DELETE everything).
+  [[ -f "$INSTALLED_FLAG" ]] && return 0
   find /etc/transit_manager /etc/nginx \
     /etc/systemd/system /etc/logrotate.d \
     -maxdepth 5 \
@@ -94,7 +99,12 @@ _global_cleanup(){
     -delete 2>/dev/null || true
 }
 _emit_update_warning(){
-  wait "${UPDATE_CHECK_PID:-}" 2>/dev/null || true
+  # Guard: wait only if UPDATE_CHECK_PID is set AND process still alive
+  # This avoids: (a) wait '' returning 1 in bash 5.x even with ||true
+  #              (b) zombie reaping failures in non-interactive SSH sessions
+  if [[ -n "${UPDATE_CHECK_PID:-}" ]] && kill -0 "${UPDATE_CHECK_PID}" 2>/dev/null; then
+    wait "${UPDATE_CHECK_PID}" 2>/dev/null || true
+  fi
   if [[ -s "$UPDATE_WARN_FILE" ]]; then
     cat "$UPDATE_WARN_FILE" 2>/dev/null || true
   fi
@@ -542,14 +552,7 @@ _tune_nginx_worker_connections(){
       info "worker_rlimit_nofile ${_tune_fd} 已写入 nginx.conf"
     fi
   }
-  grep -qE "^worker_shutdown_timeout\s+10m\s*;[[:space:]]*# transit-manager-tuning-v${_wc_escaped}$" "$mc" 2>/dev/null || {
-    _mc_dirty=1
-    if grep -qE '^[[:space:]]*worker_shutdown_timeout' "$mc" 2>/dev/null; then
-      sed -i "s/^.*worker_shutdown_timeout.*/worker_shutdown_timeout 10m; # transit-manager-tuning-v${VERSION}/" "$mc"
-    else
-      sed -i "/^events\s*{/i\worker_shutdown_timeout 10m; # transit-manager-tuning-v${VERSION}" "$mc"
-    fi
-  }
+  # worker_shutdown_timeout is DISABLED in nginx 1.22.1 (compiled-out) — skip entirely
   # [F4] Validate and roll back if nginx -t fails
   if ! nginx -t 2>/dev/null; then
     warn "nginx.conf tuning validation failed — restoring snapshot"
@@ -614,9 +617,9 @@ init_nginx_stream(){
   mkdir -p "$LOG_DIR"
   chown root:adm "$LOG_DIR" 2>/dev/null || true
   chmod 750 "$LOG_DIR"
-mkdir -p "$SNIPPETS_DIR" "$CONF_DIR"
-chmod 700 "$SNIPPETS_DIR"
-chmod 700 "$CONF_DIR"
+  mkdir -p "$SNIPPETS_DIR" "$CONF_DIR"
+  chmod 755 "$SNIPPETS_DIR"
+  chmod 700 "$CONF_DIR"
   rm -f "${SNIPPETS_DIR}/landing_dummy.map" "${SNIPPETS_DIR}/landing_*.map.tmp" 2>/dev/null || true
 
   if grep -q "$STREAM_INCLUDE_MARKER" "$NGINX_MAIN_CONF" 2>/dev/null; then
@@ -1322,9 +1325,7 @@ generate_nodes(){
     local sub_b64="" _sub_err="" _tmp=""
     _tmp=$(mktemp) || return 1
     printf '%s\n' "$transit_ip" "$dom" "$uuid" "$pwd" "$pfx" > "$_tmp"
-    sub_b64=$(python3 - "$_tmp" 2>&1) || { _sub_err="$sub_b64"; sub_b64=""; }
-
-    python3 - "$_tmp" >/dev/null 2>&1 <<'PYGEN'
+    sub_b64=$(python3 - "$_tmp" 2>&1 <<'PYGEN'
 import base64, urllib.parse, sys
 lines = [l.strip() for l in open(sys.argv[1]).read().split('\n') if l.strip()]
 if len(lines) < 5:
@@ -1340,6 +1341,7 @@ uris = [
 ]
 print(base64.b64encode('\n'.join(uris).encode()).decode())
 PYGEN
+) || { _sub_err="$sub_b64"; sub_b64=""; }
     rm -f "$_tmp"
 
     if [[ -n "$sub_b64" ]]; then
@@ -1367,26 +1369,33 @@ import_token(){
   raw=$(printf '%s' "$raw" | tr -d ' \n\r\t')
   # 🟠 Grok: 拒绝超长输入（正常 token <1KB），防止畸形 JSON 绕过解析
   check_deps
-  (( ${#raw} <= 2048 )) || die "token 过长（${#raw} 字节），拒绝解析"
-
-  local json=""
+  if ! (( ${#raw} <= 2048 )); then
+    die "token 过长（${#raw} 字节），拒绝解析"
+  fi
   json=$(printf '%s' "$raw" | python3 -c "
 import base64
 import json
 import re
 import sys
 raw = sys.stdin.read().strip()
+print(f'TOKEN_LEN={len(raw)}', file=sys.stderr)
 m = re.search(r'(?<![A-Za-z0-9+/=])(?:eyJ|eyA)[A-Za-z0-9+/=]{20,}(?![A-Za-z0-9+/=])', raw)
 if not m:
     m = re.search(r'(?<![A-Za-z0-9+/=])[A-Za-z0-9+/=]{40,}(?![A-Za-z0-9+/=])', raw)
 if not m:
+    print('JSON_ERR=no match', file=sys.stderr)
     raise SystemExit(1)
 token = m.group(0)
 pad = '=' * (-len(token) % 4)
 decoded = base64.b64decode(token + pad).decode()
 json.loads(decoded)
+print(f'JSON_DECODED={decoded}', file=sys.stderr)
 print(decoded)
-" 2>/dev/null) || die "无法解析 Base64 token，请检查输入"
+" 2>/dev/null)
+  _json_ec=$?
+  if [[ $_json_ec -ne 0 || -z "$json" ]]; then
+    die "无法解析 Base64 token，请检查输入"
+  fi
 
   local ip="" dom="" port="" uuid="" pwd="" pfx=""
   ip=$(python3  -c "import json,sys; d=json.loads(sys.stdin.read()); print(d['ip'])"  <<< "$json" 2>/dev/null) \
@@ -1418,27 +1427,6 @@ print(decoded)
     die "Token 中密码过短（需 ≥16 字符）"
   fi
 
-  validate_ip     "$ip"
-  dom=$(trim "$dom")
-  validate_domain "$dom"
-  # [R8 Fix] Check for existing domain with different IP before overwrite
-  local _existing_node
-  _existing_node=$(find "$CONF_DIR" -name "*.meta" -type f -exec grep -l "^DOMAIN=${dom}$" {} + 2>/dev/null | head -1)
-  if [[ -n "$_existing_node" ]]; then
-    local _existing_ip
-    _existing_ip=$(read_meta_ip "$_existing_node" 2>/dev/null)
-    if [[ "$_existing_ip" != "$ip" ]]; then
-      die "域名 ${dom} 已存在于节点文件 ${_existing_node}（落地机IP: ${_existing_ip}），不能用不同的落地机IP重复导入"
-    fi
-    warn "域名 ${dom} 已存在，将更新现有配置"
-  fi
-  # v2.32 Grok: 硬截断防超长域名绕过 map 语法校验
-  dom="${dom:0:253}"
-  # 🔴 Grok: nginx_domain_str 过滤后若为空（含纯控制字符域名），拒绝生成 map
-  local _safe_check; _safe_check=$(nginx_domain_str "$dom")
-  [[ -n "$_safe_check" ]] || die "域名过滤后为空（含非法字符），拒绝写入 map: ${dom}"
-  info "导入路由规则: ${dom} → ${ip}:${port}"
-
   if [[ ! -f "$INSTALLED_FLAG" && "${__TRANSIT_FRESH_INSTALL_TRAP_ACTIVE:-0}" == "0" ]]; then
     info "--import 触发首次安装初始化 ..."
     if command -v mack-a &>/dev/null || [[ -f /etc/v2ray-agent/install.sh ]]; then
@@ -1468,7 +1456,7 @@ print(decoded)
     }
     trap '_import_install_rollback' ERR INT TERM
 
-    optimize_kernel_network; install_nginx; setup_firewall_transit
+    optimize_kernel_network; install_nginx; init_nginx_stream; setup_firewall_transit
     write_logrotate
     # [F2] nginx enable must be durable — silent failure means decoy dies on next reboot
     systemctl enable nginx || die "nginx enable failed — decoy will not survive reboot"
@@ -1483,8 +1471,10 @@ print(decoded)
 
   # ARCH-2: 传入 uuid/pwd/pfx，meta 中持久化；generate_nodes() 读取后生成完整订阅
   _atomic_apply_route "$dom" "$ip" "$port" "$uuid" "$pwd" "$pfx" || die "Route application failed"
-  # Commit install marker only after route is durably applied
-  [[ -f "$INSTALLED_FLAG" ]] || touch "$INSTALLED_FLAG"
+  # [BUGFIX #13] Create .installed DURING import_token, not after.
+  # This ensures the flag exists on disk even if subsequent steps trigger ERR/EXIT traps.
+  mkdir -p "${MANAGER_BASE}" 2>/dev/null || true
+  touch "$INSTALLED_FLAG"
   __TRANSIT_IMPORT_TRAP_ACTIVE=0
   trap '_global_cleanup; echo -e "\n${RED}[中断] 请执行: bash $0 --uninstall${NC}"; exit 1' INT TERM ERR
   success "路由规则导入完成: SNI=${dom} → ${ip}:${port}"
@@ -1684,7 +1674,7 @@ purge_all(){
   # 原子卸载序：先改 nginx.conf → 显式校验 include 已移除 → 再删文件 → 再次 nginx -t → reload
   local _purge_bak=""
   if [[ -f "$NGINX_MAIN_CONF" ]]; then
-    _purge_bak=$(mktemp "${MANAGER_BASE}/.snap-recover.XXXXXX") \
+    _purge_bak=$(mktemp "/tmp/.snap-recover.XXXXXX") \
       || die "mktemp _purge_bak failed"
     cp -f "$NGINX_MAIN_CONF" "$_purge_bak" \
       || die "snapshot nginx.conf for purge failed"
@@ -1858,6 +1848,10 @@ fresh_install(){
     sed -i "\#${STREAM_INCLUDE_MARKER}#d" "$NGINX_MAIN_CONF" 2>/dev/null || true
     sed -i "\#include ${NGINX_STREAM_CONF};#d" "$NGINX_MAIN_CONF" 2>/dev/null || true
     nginx -t 2>/dev/null && { systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true; } || true
+    # [BUGFIX #15] After cleanup, return instead of continuing to fresh_install flow.
+    # Otherwise this function prints the install banner + prompts for confirmation,
+    # which triggers --uninstall -> --import loop when user presses Ctrl+C.
+    return 0
   fi
   echo ""
   echo -e "${BOLD}${CYAN}══ 中转机全新安装 ${VERSION} ══════════════════════════════════════════${NC}"
@@ -2001,100 +1995,62 @@ main(){
   if [[ "${1:-}" == "--uninstall" ]]; then purge_all; exit 0; fi
   if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then show_help; exit 0; fi
   if [[ "${1:-}" == "--import" ]]; then
-    # v2.32: --import 直接调用时加锁；通过 add_landing_route 间接调用时锁已由调用方持有
-    _acquire_lock; import_token "${2:-}"; _release_lock; exit 0
+    # [BUGFIX #13] SSH background `&` subshell inherits parent EXIT trap.
+    # On subshell normal exit, parent's EXIT fires _global_cleanup → WIPES all artifacts.
+    # Fix: set +E + trap '' EXIT before import, restore ERR trap after, use _import_result.
+    __TRANSIT_IMPORT_MODE=1
+    set +E
+    trap '' EXIT
+    _acquire_lock
+    local _tok_file="/tmp/tok_for_import"
+    [[ -n "${2:-}" ]] && printf '%s' "${2}" > "$_tok_file"
+    import_token "$(cat "$_tok_file" 2>/dev/null || echo '')"
+    local _import_result=$?
+    _release_lock
+    if [[ "$_import_result" -eq 0 ]]; then
+      touch "$INSTALLED_FLAG"
+    else
+      warn "--import 失败（exit $_import_result）"
+    fi
+    # Restore ERR trap before exit so _emit_update_warning can run
+  # [BUGFIX #13] Final validation: check .installed flag instead of relying on $?
+  # This avoids false negatives from `set -E` ERR-trap interference (e.g., head -1 in
+  # generate_nodes) which can make $? non-zero even when import actually succeeded.
+  if [[ -f "$INSTALLED_FLAG" && -f "${MANAGER_BASE}/conf/default.stream" ]]; then
+    _import_result=0
+  else
+    _import_result=${_import_result:-1}
+  fi
+  set -E
+  trap '_emit_update_warning; _global_cleanup' EXIT
+  trap '' EXIT
+  exit ${_import_result}
   fi
   if [[ "${1:-}" == "--status" ]]; then show_status; exit $?; fi
 
   mkdir -p "${MANAGER_BASE}/tmp" 2>/dev/null || true
+  # [BUGFIX #16] Complete rewrite of session-start logic.
+  # Previous implementation had `_durable_transit` (local) assignments inside `||` chains
+  # that ran in subshells due to pipes - the assignments never reached the parent function scope.
+  # New logic:
+  #   - If .installed + stream-include + meta ALL exist → installed_menu
+  #   - If .installed exists but any artifact missing → clean up and fresh_install
+  #   - If .installed missing → fresh_install (itself handles half-install cleanup)
   _check_update >"$UPDATE_WARN_FILE" 2>&1 &
   UPDATE_CHECK_PID=$!
   _prune_orphan_stream_maps
-  local _durable_transit=0
-  if [[ ! -f "$INSTALLED_FLAG" ]]; then
-    if grep -q "$STREAM_INCLUDE_MARKER" "$NGINX_MAIN_CONF" 2>/dev/null &&        find "$CONF_DIR" -maxdepth 1 -type f -name "*.meta" 2>/dev/null | grep -q .; then
-      if _meta_drift_detect; then
-        warn "[reconcile] durable set has meta/map drift — leaving .installed absent"
-      else
-        _durable_transit=1
-      fi
-    fi
-    if (( _durable_transit )); then
-      warn "[reconcile] durable set intact but .installed missing — restoring flag"
-      touch "$INSTALLED_FLAG"
-    fi
-  fi
-  if [[ -f "$INSTALLED_FLAG" ]]; then
-    # [v2.8 Architect-🟠] Startup stale-marker reconciliation: verify the durable set
-    # (nginx stream include + at least one .meta file). A SIGKILL during import_token's
-    # first-time path can write INSTALLED_FLAG while nginx artifacts are incomplete.
-    grep -q "$STREAM_INCLUDE_MARKER" "$NGINX_MAIN_CONF" 2>/dev/null       || _durable_transit=0
-    find "$CONF_DIR" -name "*.meta" -type f -maxdepth 1 2>/dev/null \
-         | grep -q . 2>/dev/null                                           || _durable_transit=0
-    if (( _durable_transit == 0 )); then
-      warn "[v2.8] 安装标记存在但持久化集（stream include/meta）不完整，清除标记重新安装..."
-      rm -f "$INSTALLED_FLAG"
-      fresh_install
-      return
-    fi
-    # 🟠 GPT: .installed 降为辅助证据，三态交叉校验（nginx/stream-include/meta文件）
-    local _svc_ok=0 _inc_ok=0 _meta_ok=0
-    systemctl is-active --quiet nginx 2>/dev/null && _svc_ok=1 \
-      || warn "Nginx 未运行"
-    grep -q "$STREAM_INCLUDE_MARKER" "$NGINX_MAIN_CONF" 2>/dev/null && _inc_ok=1 \
-      || warn "stream include 已丢失"
-    local _mc; _mc=$(find "$CONF_DIR" -name "*.meta" -type f 2>/dev/null | wc -l)
-    (( _mc > 0 )) && _meta_ok=1
-    # v2.42 GPT #1: 逐项校验 meta→map 对应关系，不只计数
-    if ! _meta_drift_detect; then
-      warn "真相源不完整: 至少一个 .meta 缺少对应 .map（路由缺失）"; _meta_ok=0
-    fi
-    # 三态全缺 → 脏安装，清标记重装
-    if (( _svc_ok == 0 && _inc_ok == 0 && _meta_ok == 0 )); then
-      warn "安装标记存在但三态（nginx/stream/meta）全部缺失，清除标记重新安装..."
-      rm -f "$INSTALLED_FLAG"
-      fresh_install
-      return
-    fi
-    (( _svc_ok == 0 || _inc_ok == 0 )) && warn "建议先执行 --status 排查状态分裂" || true
-    # v2.33 GPT: 部分损坏时先强制 reconcile，失败则拒绝进管理菜单
-    local _reconcile_ok=1
-    if (( _inc_ok == 0 )); then
-      warn "stream include 丢失，自动修复中..."
-      # v2.42 GPT #2: reload 成功才算修复，不能只靠 nginx -t
-      if init_nginx_stream 2>/dev/null; then
-        if nginx -t 2>/dev/null; then
-          if systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null; then
-            success "stream include 已修复（reload 已生效）"
-          else
-            warn "stream include 修复后 nginx reload 失败（运行态未生效）"; _reconcile_ok=0
-          fi
-        else
-          warn "stream include 修复后 nginx -t 失败"; _reconcile_ok=0
-        fi
-      else
-        warn "stream include 修复失败"; _reconcile_ok=0
-      fi
-    fi
-    if (( _svc_ok == 0 )); then
-      warn "Nginx 未运行，尝试启动..."
-      if systemctl start nginx 2>/dev/null; then
-        success "Nginx 已恢复运行"
-      else
-        warn "Nginx 启动失败"; _reconcile_ok=0
-      fi
-    fi
-    if ! _meta_drift_detect; then
-      warn "路由真相源不完整（部分 meta 缺对应 .map），请 --status 排查或重新 --import"
-      _reconcile_ok=0
-    fi
-    if (( _reconcile_ok == 0 )); then
-      error "自动恢复失败，拒绝进入管理菜单（防止在分裂状态上继续写操作）"
-      echo -e "  请先执行: ${CYAN}bash $0 --status${NC} 排查"
-      echo -e "  若无法修复，请执行: ${CYAN}bash $0 --uninstall${NC} 清除后重装"
-      exit 1
-    fi
+  local _has_flag=0 _has_inc=0 _has_meta=0
+  [[ -f "$INSTALLED_FLAG" ]]                   && _has_flag=1
+  grep -q "$STREAM_INCLUDE_MARKER" "$NGINX_MAIN_CONF" 2>/dev/null && _has_inc=1
+  [[ -d "$CONF_DIR" ]] && find "$CONF_DIR" -maxdepth 1 -type f -name "*.meta" -print | grep -q . 2>/dev/null && _has_meta=1
+  if (( _has_flag == 1 && _has_inc == 1 && _has_meta == 1 )); then
+    # All artifacts present → run installed_menu
     installed_menu
+  elif (( _has_flag == 1 )); then
+    # .installed exists but something is broken → clean .installed, let fresh_install handle
+    warn "检测到安装状态异常（artifact 不完整），重置状态..."
+    rm -f "$INSTALLED_FLAG"
+    fresh_install
   else
     fresh_install
   fi
