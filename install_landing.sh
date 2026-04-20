@@ -752,8 +752,8 @@ setup_fallback_decoy(){
   if (( need_ipv6 )); then
     atomic_write "$fallback_conf" 644 root:root <<'FDEOF'
 # xray-landing-fallback.conf — 防探针回落站，由脚本管理，请勿手动修改
-# [v2.13] listen http2: Xray passes plaintext H2 frames after TLS termination;
-#   nginx must speak h2c to avoid a distinct preface-mismatch fingerprint.
+# [CRITICAL-http2 Fix] http2 on; removed — only valid in HTTPS server blocks (ALPN).
+# This is a plain-HTTP fallback; h2c (HTTP/2 over plain TCP) not needed here.
 limit_conn_zone $binary_remote_addr zone=fallback_conn:10m;
 limit_req_zone  $binary_remote_addr zone=fallback_req:10m rate=10r/s;
 server {
@@ -763,7 +763,6 @@ server {
     listen [::1]:45232;
     server_name _;
     server_tokens off;
-    http2 on;
     limit_conn fallback_conn 4;
     limit_req  zone=fallback_req burst=50 nodelay;
     error_page 400 503 = @silent_close;
@@ -776,8 +775,7 @@ FDEOF
   else
     atomic_write "$fallback_conf" 644 root:root <<'FDEOF'
 # xray-landing-fallback.conf — 防探针回落站，由脚本管理，请勿手动修改
-# [v2.13] listen http2: Xray passes plaintext H2 frames after TLS termination;
-#   nginx must speak h2c to avoid a distinct preface-mismatch fingerprint.
+# [CRITICAL-http2 Fix] http2 on; removed — only valid in HTTPS server blocks (ALPN).
 limit_conn_zone $binary_remote_addr zone=fallback_conn:10m;
 limit_req_zone  $binary_remote_addr zone=fallback_req:10m rate=10r/s;
 server {
@@ -785,7 +783,6 @@ server {
     listen 127.0.0.1:45232;
     server_name _;
     server_tokens off;
-    http2 on;
     limit_conn fallback_conn 4;
     limit_req  zone=fallback_req burst=50 nodelay;
     error_page 400 503 = @silent_close;
