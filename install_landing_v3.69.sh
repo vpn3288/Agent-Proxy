@@ -1240,8 +1240,9 @@ cfg = {
                     # Xray schema: inbounds.streamSettings.tlsSettings.alpn → array (correct above).
                     #              inbounds.settings.fallbacks[].alpn       → string (fixed here).
                     # Arrays caused status=23 from Xray's JSON schema validator.
+                    # [R5 Fix] h2→VLESS_GRPC only (h2→TROJAN_GRPC was unreachable — first h2 rule
+                    # intercepts 100% of HTTP/2 traffic, wasting a local TCP port and memory).
                     {"alpn": "h2", "dest": PORT_VLESS_GRPC,  "xver": 0},
-                    {"alpn": "h2", "dest": PORT_TROJAN_GRPC, "xver": 0},
                     # WS: alpn=http/1.1 + path match; Trojan-TCP: no alpn/path = catch-all
                     {"alpn": "http/1.1", "path": f"/{PFX}-vw", "dest": PORT_VLESS_WS, "xver": 0},
                     {"dest": PORT_TROJAN_TCP, "xver": 0}
@@ -1450,8 +1451,7 @@ SVCEOF
     "$_svc_tmp"
   mv -f "$_svc_tmp" "/etc/systemd/system/${LANDING_SVC}"
   chmod 644 "/etc/systemd/system/${LANDING_SVC}"
-  sed -i 's|ReadOnlyPaths=|ReadWritePaths='"${CERT_BASE}"'\
-ReadOnlyPaths=|' "/etc/systemd/system/${LANDING_SVC}"
+  sed -i 's|ReadOnlyPaths=|ReadOnlyPaths='"${CERT_BASE}"' |' "/etc/systemd/system/${LANDING_SVC}"
   # [Doc6-Gemini-🔴] xray-landing.service.d drop-in：高并发 gRPC 下 Xray 内部端口也消耗 fd
   # [v2.9] Always rewrite with dynamic value — previous guard against 1048576 missed updates.
   local _xray_svc_d="/etc/systemd/system/xray-landing.service.d"
@@ -2736,6 +2736,7 @@ purge_all(){
 
   rm -f /etc/nginx/conf.d/xray-landing-fallback.conf 2>/dev/null || true
   rm -f "/etc/systemd/system/nginx.service.d/landing-override.conf" 2>/dev/null || true
+  rmdir "/etc/systemd/system/nginx.service.d" 2>/dev/null || true
   # v1.5: 清理新增的 drop-in 和 journald 上限配置
   rm -f "/etc/systemd/system/xray-landing.service.d/xray-landing-limits.conf" 2>/dev/null || true
   rmdir "/etc/systemd/system/xray-landing.service.d" 2>/dev/null || true
@@ -2931,7 +2932,6 @@ fresh_install(){
   # [HermesAgent] mack-a detection for landing node
   if command -v mack-a &>/dev/null || [[ -f /etc/v2ray-agent/install.sh ]]; then
     # [R23 Fix] Explicitly tell user to stop mack-a services when port conflict detected
-    ss -tlnp 2>/dev/null | grep -q ":443 " && die "443 端口已被占用！检测到 mack-a 已安装，请先执行: systemctl stop xray nginx v2ray 后再安装"
     warn "检测到 mack-a 已安装，本落地机将与其共享端口，请确认无冲突"
   fi
   __LANDING_FRESH_INSTALL_TRAP_ACTIVE=1

@@ -527,27 +527,27 @@ _tune_nginx_worker_connections(){
   grep -qE "^[[:space:]]*worker_connections[[:space:]]+${_wc_val}[[:space:]]*;[[:space:]]*# transit-manager-tuning-v${_wc_escaped}$" "$mc" 2>/dev/null || {
     _mc_dirty=1
     if grep -qE '^[[:space:]]*worker_connections' "$mc" 2>/dev/null; then
-      sed -i -E "s/^([[:space:]]*worker_connections[[:space:]]+)[0-9]+([[:space:]]*;.*)/\1${_wc_val}; # transit-manager-tuning-v${_wc_escaped}/" "$mc"
+      sed -i -E "s/^([[:space:]]*worker_connections[[:space:]]+)[0-9]+([[:space:]]*;.*)/\1${_wc_val}; # transit-manager-tuning-v${VERSION}/" "$mc"
     else
-      sed -i "/^events\s*{/a\    worker_connections ${_wc_val}; # transit-manager-tuning-v${_wc_escaped}" "$mc"
+      sed -i "/^events\s*{/a\    worker_connections ${_wc_val}; # transit-manager-tuning-v${VERSION}" "$mc"
     fi
   }
   # Idempotent: strip any stale worker_rlimit_nofile line then re-inject current dynamic value
   grep -qE "^worker_rlimit_nofile\s+${_tune_fd}\s*;[[:space:]]*# transit-manager-tuning-v${_wc_escaped}$" "$mc" 2>/dev/null || {
     _mc_dirty=1
     if grep -qE '^[[:space:]]*worker_rlimit_nofile' "$mc" 2>/dev/null; then
-      sed -i "s/^[[:space:]]*worker_rlimit_nofile.*/worker_rlimit_nofile ${_tune_fd}; # transit-manager-tuning-v${_wc_escaped}/" "$mc"
+      sed -i "s/^[[:space:]]*worker_rlimit_nofile.*/worker_rlimit_nofile ${_tune_fd}; # transit-manager-tuning-v${VERSION}/" "$mc"
     else
-      sed -i "/^events\s*{/i\worker_rlimit_nofile ${_tune_fd}; # transit-manager-tuning-v${_wc_escaped}" "$mc"
+      sed -i "/^events\s*{/i\worker_rlimit_nofile ${_tune_fd}; # transit-manager-tuning-v${VERSION}" "$mc"
       info "worker_rlimit_nofile ${_tune_fd} 已写入 nginx.conf"
     fi
   }
   grep -qE "^worker_shutdown_timeout\s+10m\s*;[[:space:]]*# transit-manager-tuning-v${_wc_escaped}$" "$mc" 2>/dev/null || {
     _mc_dirty=1
     if grep -qE '^[[:space:]]*worker_shutdown_timeout' "$mc" 2>/dev/null; then
-      sed -i "s/^.*worker_shutdown_timeout.*/worker_shutdown_timeout 10m; # transit-manager-tuning-v${_wc_escaped}/" "$mc"
+      sed -i "s/^.*worker_shutdown_timeout.*/worker_shutdown_timeout 10m; # transit-manager-tuning-v${VERSION}/" "$mc"
     else
-      sed -i "/^events\s*{/i\worker_shutdown_timeout 10m; # transit-manager-tuning-v${_wc_escaped}" "$mc"
+      sed -i "/^events\s*{/i\worker_shutdown_timeout 10m; # transit-manager-tuning-v${VERSION}" "$mc"
     fi
   }
   # [F4] Validate and roll back if nginx -t fails
@@ -868,30 +868,21 @@ _bulldoze_input_refs6_t(){
   _prev_int_trap=$(trap -p INT || true)
   _prev_term_trap=$(trap -p TERM || true)
   _fw_transit_rollback(){
-    # Atomic swap: remove INPUT ref -> swap chains -> cleanup
+    # Fail-closed rollback: remove ALL chain refs from INPUT, flush all temp chains
+    # Before this fix: FW_TMP remained referenced if rollback fired after line 934 but before line 940
     local _n
-    mapfile -t _n < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="${FW_CHAIN}_OLD" '$2==c {print $1}' | sort -rn)
-    for _n in "${_n[@]}"; do iptables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
-    mapfile -t _n < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="${FW_CHAIN}" '$2==c {print $1}' | sort -rn)
-    for _n in "${_n[@]}"; do iptables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
-    mapfile -t _n < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="${FW_CHAIN6}_OLD" '$2==c {print $1}' | sort -rn)
-    for _n in "${_n[@]}"; do ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
-    mapfile -t _n < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="${FW_CHAIN6}" '$2==c {print $1}' | sort -rn)
-    for _n in "${_n[@]}"; do ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
-    iptables -w 2 -E "FWDUMMY" "${FW_CHAIN}_OLD" 2>/dev/null || true
-    iptables -w 2 -E "${FW_CHAIN}" "FWDUMMY" 2>/dev/null || true
-    iptables -w 2 -E "${FW_CHAIN}_OLD" "${FW_CHAIN}" 2>/dev/null || true
-    iptables -w 2 -F "${FW_CHAIN}" 2>/dev/null || true
-    iptables -w 2 -X "${FW_CHAIN}" 2>/dev/null || true
-    iptables -w 2 -F "${FW_TMP}" 2>/dev/null || true
-    iptables -w 2 -X "${FW_TMP}" 2>/dev/null || true
-    ip6tables -w 2 -E "FWDUMMY6" "${FW_CHAIN6}_OLD" 2>/dev/null || true
-    ip6tables -w 2 -E "${FW_CHAIN6}" "FWDUMMY6" 2>/dev/null || true
-    ip6tables -w 2 -E "${FW_CHAIN6}_OLD" "${FW_CHAIN6}" 2>/dev/null || true
-    ip6tables -w 2 -F "${FW_CHAIN6}" 2>/dev/null || true
-    ip6tables -w 2 -X "${FW_CHAIN6}" 2>/dev/null || true
-    ip6tables -w 2 -F "${FW_TMP6}" 2>/dev/null || true
-    ip6tables -w 2 -X "${FW_TMP6}" 2>/dev/null || true
+    # Remove FW_CHAIN/OLD and FW_TMP refs from INPUT (fail closed — chains may not exist)
+    for _c in "${FW_CHAIN}_OLD" "$FW_CHAIN" "${FW_TMP}" "${FW_CHAIN6}_OLD" "$FW_CHAIN6" "${FW_TMP6}"; do
+      mapfile -t _n < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_c" '$2==c {print $1}' | sort -rn)
+      for _n in "${_n[@]}"; do iptables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
+      mapfile -t _n < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_c" '$2==c {print $1}' | sort -rn)
+      for _n in "${_n[@]}"; do ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
+    done
+    # Flush and delete all temp chains (ignore errors — chains may already be gone)
+    iptables -w 2 -F "${FW_TMP}"  2>/dev/null || true; iptables -w 2 -X "${FW_TMP}"  2>/dev/null || true
+    iptables -w 2 -F "${FW_CHAIN}" 2>/dev/null || true; iptables -w 2 -X "${FW_CHAIN}" 2>/dev/null || true
+    ip6tables -w 2 -F "${FW_TMP6}"  2>/dev/null || true; ip6tables -w 2 -X "${FW_TMP6}"  2>/dev/null || true
+    ip6tables -w 2 -F "${FW_CHAIN6}" 2>/dev/null || true; ip6tables -w 2 -X "${FW_CHAIN6}" 2>/dev/null || true
     # v2.36 GPT: 区分"有旧快照"和"首次安装无旧文件"两种情形
     if [[ -n "${_snap_persist:-}" && -f "${_snap_persist:-}" ]]; then
       # 存在旧快照 → 还原
@@ -1451,7 +1442,7 @@ print(decoded)
     local _existing_ip
     _existing_ip=$(read_meta_ip "$_existing_node" 2>/dev/null)
     if [[ "$_existing_ip" != "$ip" ]]; then
-      die "域名 ${dom} 已存在于节点文件 ${_existing_node}（中转IP: ${_existing_ip}），不能用不同的中转IP重复导入"
+      die "域名 ${dom} 已存在于节点文件 ${_existing_node}（落地机IP: ${_existing_ip}），不能用不同的落地机IP重复导入"
     fi
     warn "域名 ${dom} 已存在，将更新现有配置"
   fi
