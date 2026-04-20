@@ -522,8 +522,8 @@ _tune_nginx_worker_connections(){
   local _wc_ram; _wc_ram=$(free -m 2>/dev/null | awk '/Mem:/{print int($2/2*1000)}'); _wc_ram=${_wc_ram:-100000}
   (( _wc_ram < 10000 )) && _wc_ram=10000
   (( _wc_ram > 200000 )) && _wc_ram=200000
-  local _wc_val="$_wc_ram"
-  local _wc_escaped; _wc_escaped=$(printf '%s' "$VERSION" | sed 's/[.\-]/\\&/g')
+  local _wc_val=$(( _wc_ram / $(nproc 2>/dev/null || echo 1) ))
+  local _wc_escaped; _wc_escaped=$(printf '%s' "$VERSION" | sed 's/[.\-]/\&/g')
   grep -qE "^[[:space:]]*worker_connections[[:space:]]+${_wc_val}[[:space:]]*;[[:space:]]*# transit-manager-tuning-v${_wc_escaped}$" "$mc" 2>/dev/null || {
     _mc_dirty=1
     if grep -qE '^[[:space:]]*worker_connections' "$mc" 2>/dev/null; then
@@ -2086,10 +2086,14 @@ main(){
       warn "stream include 丢失，自动修复中..."
       # v2.42 GPT #2: reload 成功才算修复，不能只靠 nginx -t
       if init_nginx_stream 2>/dev/null; then
-        if systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null; then
-          nginx -t 2>/dev/null && success "stream include 已修复（reload 已生效）"             || { warn "stream include 修复后 nginx -t 失败"; _reconcile_ok=0; }
+        if nginx -t 2>/dev/null; then
+          if systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null; then
+            success "stream include 已修复（reload 已生效）"
+          else
+            warn "stream include 修复后 nginx reload 失败（运行态未生效）"; _reconcile_ok=0
+          fi
         else
-          warn "stream include 修复后 nginx reload 失败（运行态未生效）"; _reconcile_ok=0
+          warn "stream include 修复后 nginx -t 失败"; _reconcile_ok=0
         fi
       else
         warn "stream include 修复失败"; _reconcile_ok=0
