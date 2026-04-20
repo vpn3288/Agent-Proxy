@@ -222,7 +222,7 @@ atomic_write()(
   local target="$1" mode="$2" owner_group="${3:-root:root}" dir tmp
   dir="$(dirname "$target")"
   mkdir -p "$dir"
-  tmp="$(mktemp "$dir/.xray-landing.XXXXXX" 2>/dev/null)" \
+  tmp="$(mktemp "$dir/.xray-landing.XXXXXX")" \
     || { echo "atomic_write: mktemp failed for $dir" >&2; exit 1; }
   trap 'rm -f "$tmp" 2>/dev/null || true' EXIT
   cat >"$tmp" \
@@ -796,14 +796,21 @@ FDEOF
 _write_cert_reload_script(){
   # [R11 Fix] Use quoted heredoc <<'RELOAD_EOF' so ${CERT_DIR} and other
   # variables are written literally (expanded at runtime by acme.sh, not during cat).
-  (atomic_write "$CERT_RELOAD_SCRIPT" 755 root:root <<'RELOAD_EOF'
+  # [FIX] Use shell heredoc directly — Python approach caused 'unbound variable' exits with set -eu.
+  # [FIX] Use atomic mv + trap instead of mktemp to avoid set -eu triggering on mktemp exit code.
+  local _reload_target="${CERT_RELOAD_SCRIPT}"
+  local _reload_mode=755
+  local _reload_dir; _reload_dir="$(dirname "$_reload_target")"
+  mkdir -p "$_reload_dir"
+  # Write content to a temp file then atomic mv to target
+  cat > "${_reload_target}.tmp" <<'RELOAD_EOF'
 #!/bin/sh
-# xray-landing-reload-v\${VERSION}
+# xray-landing-reload-v${VERSION}
 set -eu
-CERT_DIR="\${1:-}"
+CERT_DIR="${1:-}"
 # [R12 Fix] Validate CERT_DIR is non-empty AND exists before any chown/chmod operations
-if [ -z "\$CERT_DIR" ] || [ ! -d "\$CERT_DIR" ]; then
-  logger -t acme-xray-landing "ERROR: Invalid CERT_DIR: '\$CERT_DIR'"
+if [ -z "$CERT_DIR" ] || [ ! -d "$CERT_DIR" ]; then
+  logger -t acme-xray-landing "ERROR: Invalid CERT_DIR: '$CERT_DIR'"
   exit 1
 fi
 
@@ -819,17 +826,17 @@ fi
 
 # 先修权限（依赖 reload 成功前确保权限正确）
 # [REVIEWER-6 Fix] Die on chown failure — masked error leaves certs owned by wrong user
-chown -R root:xray-landing "\$CERT_DIR" \
-  || { logger -t acme-xray-landing "ERROR: chown failed for \$CERT_DIR"; exit 1; }
+chown -R root:xray-landing "$CERT_DIR" \
+  || { logger -t acme-xray-landing "ERROR: chown failed for $CERT_DIR"; exit 1; }
 # [REVIEWER-6 Fix] Die on chmod failure — masked error leaves key.pem world-readable
-chmod 750 "\$CERT_DIR" \
-  || { logger -t acme-xray-landing "ERROR: chmod 750 failed for \$CERT_DIR"; exit 1; }
-chmod 640 "\$CERT_DIR/cert.pem" "\$CERT_DIR/fullchain.pem" \
+chmod 750 "$CERT_DIR" \
+  || { logger -t acme-xray-landing "ERROR: chmod 750 failed for $CERT_DIR"; exit 1; }
+chmod 640 "$CERT_DIR/cert.pem" "$CERT_DIR/fullchain.pem" \
   || { logger -t acme-xray-landing "ERROR: chmod 640 failed for certs"; exit 1; }
-chmod 640 "\$CERT_DIR/key.pem" \
+chmod 640 "$CERT_DIR/key.pem" \
   || { logger -t acme-xray-landing "ERROR: chmod 640 failed for key.pem — key may be exposed"; exit 1; }
 
-if openssl x509 -checkend 86400 -noout -in "\${CERT_DIR}/fullchain.pem" 2>/dev/null; then
+if openssl x509 -checkend 86400 -noout -in "${CERT_DIR}/fullchain.pem" 2>/dev/null; then
   # 证书有效：Xray 需要 restart 加载新证书（reload 对 Xray 无效），使用 restart 避免 StartLimitBurst 消耗
   # [v2.10 Architect-🟠] Restart is the correct behavior for Xray cert reload. The reload attempt first
   # is for future-proofing if Xray ever supports in-place reload, but restart is the actual fallback.
@@ -837,18 +844,18 @@ if openssl x509 -checkend 86400 -noout -in "\${CERT_DIR}/fullchain.pem" 2>/dev/n
     # [v2.32 Fix] reload失败时尝试一次restart，再失败才退出
     logger -t acme-xray-landing "WARN: reload failed — attempting restart"
     if ! /bin/systemctl restart xray-landing.service 2>/dev/null; then
-        echo "xray restart failed — reload also failed earlier" >&2; _msg="FATAL: reload and restart both failed for xray-landing.service"; logger -t acme-xray-landing "\$_msg"; echo "\$(date '+%Y-%m-%d %H:%M:%S') \$_msg" >> /var/log/acme-xray-landing-renew.log || true; exit 1
+        echo "xray restart failed — reload also failed earlier" >&2; _msg="FATAL: reload and restart both failed for xray-landing.service"; logger -t acme-xray-landing "$_msg"; echo "$(date '+%Y-%m-%d %H:%M:%S') $_msg" >> /var/log/acme-xray-landing-renew.log || true; exit 1
     fi
   fi
 else
   # 证书校验失败：只记录告警，保留旧内存态等下次 cron 重试，绝不主动干预进程
-  _msg="WARN: 证书续期后校验失败（\${CERT_DIR}），保留旧进程态，等待下次 cron 重试"
-  logger -t acme-xray-landing "\$_msg"
-  echo "\$(date '+%Y-%m-%d %H:%M:%S') \$_msg" >> /var/log/acme-xray-landing-renew.log || true
+  _msg="WARN: 证书续期后校验失败（${CERT_DIR}），保留旧进程态，等待下次 cron 重试"
+  logger -t acme-xray-landing "$_msg"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $_msg" >> /var/log/acme-xray-landing-renew.log || true
   exit 1
 fi
 RELOAD_EOF
-  )
+  chmod 755 "${_reload_target}.tmp" && mv -f "${_reload_target}.tmp" "$_reload_target"
 }
 
 issue_certificate(){
@@ -972,24 +979,21 @@ _wait_dns_txt(){
 # 移除之前错误引入的 nginx stop/start，避免每次申请证书都导致 45231 decoy 宕机
 rm -rf "${ACME_HOME}/${domain}_ecc" 2>/dev/null || true
 local issued=0
-  # [CRITICAL-DNS Fix] REMOVED _wait_dns_txt pre-check: acme.sh --issue creates the TXT record
-  # internally, then waits for propagation and verifies itself. Pre-polling for a non-existent TXT
-  # before issuance always times out (120s wasted), defeating the purpose. Let acme.sh manage
-  # its own DNS propagation with its built-in --dnssleep mechanism.
-  for try in 1 2; do
+  # acme.sh manages its own DNS TXT creation and verification retries internally.
+  for try in 1 2 3 4 5; do
     local _force_opt=""
     (( try > 1 )) && _force_opt="--force"
     info "申请证书（DNS-01/Cloudflare）: ${domain}，第 ${try} 次尝试..."
     # acme.sh handles DNS TXT creation, propagation waiting, and verification internally.
-    # --dnssleep 0 = let acme.sh control timing (its default is ~10s polling interval).
+    # --dnssleep 60 = acme.sh polls every 60s to check TXT record propagation before verifying.
     CF_Token="$cf_token" "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --issue --dns dns_cf \
       --domain "$domain" --keylength ec-256 \
       --server letsencrypt \
-      --dnssleep 0 \
+      --dnssleep 60 \
       ${_force_opt} && issued=1 && break || true
-    if (( try < 2 )); then
-      warn "第 ${try} 次申请失败，等待 DNS 传播后重试..."
-      _wait_dns_txt "$domain"
+    if (( try < 5 )); then
+      warn "第 ${try} 次申请失败，${RETRY_INTERVAL:-10}秒后重试..."
+      sleep ${RETRY_INTERVAL:-10}
     fi
   done
   (( issued )) || die "证书申请失败（请检查 Token 权限：Zone:DNS:Edit，或 3 分钟后重试）"
@@ -1137,6 +1141,7 @@ sync_xray_config(){
     export _BIND_IP="$BIND_IP"
     python3 - <<'PYEOF'
 import json, os, glob, uuid as _uuid, random as _rand
+from pathlib import Path
 
 nodes_dir    = os.environ['_NODES_DIR']
 cert_base    = os.environ['_CERT_BASE']
@@ -1396,7 +1401,7 @@ User=@@LANDING_USER@@
 NoNewPrivileges=true
 ExecStartPre=/bin/sh -c 'test -f @@LANDING_CONF@@ || { echo "config.json missing"; exit 1; }'
 ExecStartPre=/bin/sh -c 'python3 -c "import json,sys; json.load(open(sys.argv[1]))" @@LANDING_CONF@@ 2>/dev/null || { echo "config.json invalid JSON"; exit 1; }'
-ExecStartPre=/bin/sh -c 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); vision=[i for i in d[\"inbounds\"] if \"flow\" in str(i.get(\"settings\",{}).get(\"clients\",[{}])[0])]; sys.exit(1 if any(i.get(\"settings\",{}).get(\"mux\",{}).get(\"enabled\") for i in vision) else 0)" @@LANDING_CONF@@ 2>/dev/null || { echo "Vision inbound has mux enabled (unsupported with flow=xtls-rprx-vision)"; exit 1; }'
+# Note: Xray itself rejects mux+vision at runtime; no separate pre-check needed.
 @@CAP_LINE@@
 @@CAP_BOUND@@
 ExecStart=@@LANDING_BIN@@ run -config @@LANDING_CONF@@
