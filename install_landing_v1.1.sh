@@ -167,6 +167,8 @@ find /etc/xray-landing /etc/landing_manager /etc/nginx /etc/systemd/system \
 # /tmp/xray_tmp_* moved to MANAGER_BASE/tmp; .manager.* staging files likewise.
 # No broad /tmp scan to avoid accidentally deleting unrelated user files.
 _global_cleanup(){
+  # Guard: only clean when NOT fully installed (INSTALLED_FLAG proves installation completed)
+  [[ -f "$INSTALLED_FLAG" && -f "$LANDING_CONF" ]] && return 0 2>/dev/null || true
   find /etc/xray-landing /etc/landing_manager /etc/nginx \
     /etc/systemd/system /etc/logrotate.d \
     -maxdepth 5 \
@@ -180,7 +182,8 @@ _global_cleanup(){
     -delete 2>/dev/null || true
 }
 _emit_update_warning(){
-  wait "${UPDATE_CHECK_PID:-}" 2>/dev/null || true
+  # Guard: process may have already exited (e.g. network check finished before menu choice)
+  [[ -n "${UPDATE_CHECK_PID:-}" ]] && kill -0 "${UPDATE_CHECK_PID}" 2>/dev/null && wait "${UPDATE_CHECK_PID}" 2>/dev/null || true
   if [[ -s "$UPDATE_WARN_FILE" ]]; then
     cat "$UPDATE_WARN_FILE" 2>/dev/null || true
   fi
@@ -2018,7 +2021,7 @@ NEOF_TMP
       local _refs
       _refs=$(find "${MANAGER_BASE}/nodes" -name "*.conf" -not -name "tmp-*.conf" -type f \
         -exec grep -l "^DOMAIN=${NEW_DOMAIN}$" {} + 2>/dev/null | sed '/^$/d' | wc -l)
-      if (( _refs == 0 )); then
+      if [[ "$_refs" -eq 0 ]]; then
         "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --remove --domain "${NEW_DOMAIN}" --ecc 2>/dev/null || true
         rm -rf "${CERT_BASE}/${NEW_DOMAIN}" 2>/dev/null || true
       else
@@ -2071,7 +2074,7 @@ NEOF_TMP
   trap '_global_cleanup; rm -f "$_node_conf" 2>/dev/null; echo -e "\n${RED}[中断] 请执行: bash $0 --uninstall${NC}"; exit 1' INT TERM
 
   # BUG-5 FIX: 只有 _fw_skip==0 时才执行防火墙重建；IP已存在时跳过 iptables 但继续全流程
-  if (( _fw_skip == 0 )); then
+  if [[ "$_fw_skip" -eq 0 ]]; then
     if ! ( setup_firewall ); then
       rm -f "$_node_conf"
       if [[ -n "$_snap_cfg_node" && -f "$_snap_cfg_node" ]]; then
@@ -2128,7 +2131,7 @@ delete_node(){
     printf "  [%-2d] %-40s 中转: %s\n" $((++n)) "$dom" "$ip"
   done < <(find "${MANAGER_BASE}/nodes" -name "*.conf" -type f 2>/dev/null | sort)
 
-  (( n == 0 )) && { warn "无可删除的节点"; return; }
+    [[ "$n" -eq 0 ]] && { warn "无可删除的节点"; return; }
   (( n == 1 )) && die "仅剩最后一个节点！请使用「清除本系统所有数据」"
 
   read -rp "请输入节点编号: " DEL_INPUT
@@ -2220,7 +2223,7 @@ delete_node(){
     _release_lock; warn "节点已恢复，请检查: journalctl -u ${LANDING_SVC}"
   else
     # Transaction confirmed: now safe to delete cert (service is running without it)
-    if (( remaining == 0 )); then
+    if [[ "$remaining" -eq 0 ]]; then
       info "域名 ${DEL_DOMAIN} 已无中转机，清理证书..."
       if [[ -f "${ACME_HOME}/acme.sh" ]]; then
         "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --remove --domain "$DEL_DOMAIN" --ecc 2>/dev/null || true
@@ -2852,7 +2855,7 @@ show_all_nodes_info(){
     echo -e "  ─────────────────────────────────────────────────"
     print_pairing_info "$_npip" "$_ndom" "$_npwd" "$_ntip"
   done < <(find "${MANAGER_BASE}/nodes" -name "*.conf" -not -name "tmp-*.conf" -type f 2>/dev/null | sort)
-  if (( _node_count == 0 )); then
+  if [[ "$_node_count" -eq 0 ]]; then
     warn "（无已配置节点）"
   fi
   echo ""
@@ -3211,7 +3214,7 @@ main(){
       [[ -n "$_ndom" && -f "${CERT_BASE}/${_ndom}/fullchain.pem" ]] || { _sym_node=0; break; }
     done < <(find "${MANAGER_BASE}/nodes" -name "*.conf" -not -name "tmp-*.conf" -type f -maxdepth 1 2>/dev/null)
     [[ -z $(find "${MANAGER_BASE}/nodes" -name "*.conf" -not -name "tmp-*.conf" -type f -maxdepth 1 2>/dev/null) ]] && _sym_node=0
-    if (( _sym_mgr && _sym_conf && _sym_node )); then
+    if [[ "$_sym_mgr" -eq 1 && "$_sym_conf" -eq 1 && "$_sym_node" -eq 1 ]]; then
       warn "[v2.9] 持久化集完整但安装标记缺失（崩溃于最后一步），自动恢复标记..."
       touch "$INSTALLED_FLAG"
       # fall through to the installed branch below
@@ -3226,13 +3229,13 @@ main(){
     [[ -f "$LANDING_CONF" ]]                                            || _durable_ok=0
     find "${MANAGER_BASE}/nodes" -name "*.conf" -not -name "tmp-*.conf" \
          -type f -maxdepth 1 2>/dev/null | grep -q . 2>/dev/null       || _durable_ok=0
-    if (( _durable_ok == 0 )); then
+    if [[ "$_durable_ok" -eq 0 ]]; then
       warn "[v2.8] 安装标记存在但持久化集（manager.conf/config.json/nodes/*.conf）不完整，清除标记重新安装..."
       rm -f "$INSTALLED_FLAG"
-      # Also purge any .manager.* staging file that may have survived a SIGKILL
+      # Also purge any .manager.* staging file
       find "${MANAGER_BASE}" /tmp -maxdepth 1 -name '.manager.*' -type f -delete 2>/dev/null || true
       fresh_install
-      return
+      return 0
     fi
     load_manager_config
     # 🟠 GPT: .installed 降为辅助证据，三态交叉校验（服务/配置/节点）
@@ -3244,18 +3247,18 @@ main(){
     local _nc; _nc=$(find "${MANAGER_BASE}/nodes" -name "*.conf" -type f 2>/dev/null | wc -l)
     (( _nc > 0 )) && _node_ok=1
     # 三态全部缺失 → 脏安装，清除标记重新安装
-    if (( _svc_ok == 0 && _conf_ok == 0 && _node_ok == 0 )); then
+    if [[ "$_svc_ok" -eq 0 && "$_conf_ok" -eq 0 && "$_node_ok" -eq 0 ]]; then
       warn "安装标记存在但三态（服务/配置/节点）全部缺失，清除标记重新安装..."
       rm -f "$INSTALLED_FLAG"
       fresh_install
       return
     fi
     # v2.32 GPT: 真相源丢失时拒绝进入管理菜单（所有写操作均依赖 manager.conf）
-    if (( _conf_ok == 0 )); then
+    if [[ "$_conf_ok" -eq 0 ]]; then
       die "manager.conf（真相源）已丢失，无法安全操作。请执行 --uninstall 清除后重装，或从备份恢复 ${MANAGER_CONFIG}"
     fi
     # v2.33 GPT BUG-01: 服务恢复失败时拒绝进管理菜单，避免在不一致状态上继续写操作
-    if (( _svc_ok == 0 )); then
+    if [[ "$_svc_ok" -eq 0 ]]; then
       warn "服务未运行，尝试自动恢复..."
       local _recovered=0
       if ( sync_xray_config ) 2>/dev/null && systemctl restart "$LANDING_SVC" 2>/dev/null; then
@@ -3265,7 +3268,7 @@ main(){
           _recovered=1
         fi
       fi
-      if (( _recovered == 0 )); then
+      if [[ "$_recovered" -eq 0 ]]; then
         error "自动恢复失败，拒绝进入管理菜单（防止在分裂状态上继续写操作）"
         echo -e "  请先执行: ${CYAN}bash $0 --status${NC} 排查状态分裂"
         echo -e "  若无法修复，请执行: ${CYAN}bash $0 --uninstall${NC} 清除后重装"
