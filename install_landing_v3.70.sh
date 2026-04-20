@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-IFS=$'\n\t'
-# install_landing_v3.63.sh — 落地机安装脚本 v3.63
+# v3.69: cycle 13 — C13-1 CF_TOKEN renewal | C13-2 Python syntax | R6 chmod masking | R7 duplicate INPUT jump | R9 uninstall die | R10 mux check
+# install_landing_v3.70.sh — 落地机安装脚本 v3.70
 # 版本历史：
-# v3.63: HermesAgent cycle 6 — [R9] pre-export port validation(C) | [R10] reload script check | [R12] Vision mux validation | [R14] home dir cleanup | [R16] Python timeout
+# v3.70: cycle 14 — R8 subuid/subgid cleanup | R14 home dir removal | R15 ProtectKernelModules=true
 # v3.62: HermesAgent cycle 5 — [R11] DNS wait trap | [R12] CERT_DIR validation | [R13] empty content check | [R14] dup IP warn | [R15] ControlGroups | [R17] password consistency | [R18] cert mon del verify | [R19] port conflict | [R20] UUID fallback | [R21] CF Zone ID | [R23] mack-a msg
 # v3.60: HermesAgent cycle 3 — [F1] TROJAN_GRPC port=0 bug | [F2] _bulldoze awk parse | [F3] _CAP_BOUND unbound in do_set_port
 # v3.58: HermesAgent cycle 1 — [H-1] 修复域名连续点校验 | [H-2] 增加落地机 mack-a 检测
@@ -118,7 +118,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 # - 修复 acme.sh 首次安装下载/执行缺失，恢复证书申请链路
 # - 将 INPUT 链清理改为行号删除，避免 save/restore 重放旧规则
 # - 修正 nginx worker_connections 注释覆盖逻辑，防止升级标签堆叠
-readonly VERSION="v3.69"
+readonly VERSION="v3.70"
 # v2.17: Gemini审计修复·gRPC fallback使用纯ALPN匹配
 # v2.15: 初始稳定版本
 
