@@ -1418,6 +1418,7 @@ ReadOnlyPaths=@@LANDING_BASE@@ /usr/local/share/xray-landing
 LogsDirectory=xray-landing
 PrivateTmp=true
 PrivateDevices=true
+ProtectKernelModules=true
 ProtectKernelLogs=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
@@ -2794,8 +2795,9 @@ purge_all(){
         [[ -n "$LANDING_USER" ]] && pgrep -u "$LANDING_USER" >/dev/null 2>&1 || break
         sleep 0.5
       done
-      # [R5 Fix] Use userdel without -r — LANDING_USER was created with -M (no home dir).
-      # Passing -r causes noisy failure when /nonexistent doesn't exist or isn't removable.
+      # [R8 Fix] Clean up subuid/subgid entries (systemd user namespace artifacts)
+      sed -i "/^${LANDING_USER}:/d" /etc/subuid 2>/dev/null || true
+      sed -i "/^${LANDING_USER}:/d" /etc/subgid 2>/dev/null || true
       if ! userdel "$LANDING_USER" 2>/dev/null; then
         warn "userdel 失败 (用户可能仍有运行中进程) — 需要手动清理"
       fi
@@ -2803,8 +2805,11 @@ purge_all(){
     fi
   fi
 
-    rm -f /etc/security/limits.d/99-xray-landing.conf 2>/dev/null || true
-  sed -i '/# xray-landing: keep cron\/PAM sessions aligned/,/^root hard nofile/d' /etc/security/limits.conf 2>/dev/null || true
+  # [R14 Fix] Remove home directory if it exists (some Debian/Ubuntu systems
+  # create it despite useradd -M; also handles cases where it was created manually)
+  [[ -d "/home/${LANDING_USER}" ]] && rm -rf "/home/${LANDING_USER}" 2>/dev/null || true
+  rm -f /etc/security/limits.d/99-xray-landing.conf 2>/dev/null || true
+  sed -i '/# xray-landing: keep cron\\/PAM sessions aligned/,/^root hard nofile/d' /etc/security/limits.conf 2>/dev/null || true
   rm -rf "$LANDING_LOG" 2>/dev/null || true
   rm -f /var/log/acme-xray-landing-renew.log /var/run/xray-landing.update.warn 2>/dev/null || true
   rm -f "$LANDING_BIN" "$CERT_RELOAD_SCRIPT" 2>/dev/null || true
