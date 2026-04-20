@@ -979,10 +979,12 @@ for try in 1 2; do
     # [R2 Fix] Wait for DNS propagation BEFORE first issuance attempt (not just between retries)
     # [R5 Partial Fix] Die on DNS timeout before first attempt — don't waste ACME attempts
     (( try == 1 )) && ! _wait_dns_txt "$domain" && die "DNS TXT 记录在 120 秒内未传播，终止证书申请（请等待后重试）"
+    # [R2 Fix] Remove --dnssleep 0 — _wait_dns_txt already provides up to 120s of polling
+    # before each issuance attempt. Passing --dnssleep 0 on the retry attempt causes acme.sh
+    # to immediately re-validate without any buffer, hard-failing if DNS hasn't propagated yet.
     CF_Token="$cf_token" "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --issue --dns dns_cf \
       --domain "$domain" --keylength ec-256 \
       --server letsencrypt \
-      --dnssleep 0 \
       ${_force_opt} && issued=1 && break || true
     if (( try < 2 )); then
       warn "第 ${try} 次申请失败，等待 DNS 传播后重试..."
@@ -1434,10 +1436,14 @@ SVCEOF
   (( _svc_fd > 10485760 )) && _svc_fd=10485760
 
   # sed-inject 所有运行时路径（占位符方式，绕过 heredoc 变量展开问题）
-  # [R17 Fix] Always grant CAP_NET_BIND_SERVICE — fallback ports (45231/45232) are <1024
-  # regardless of LANDING_PORT value, and Xray needs this cap to bind them.
-  local _cap_escaped="AmbientCapabilities=CAP_NET_BIND_SERVICE"
-  local _cap_bound_escaped="CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+  # [R17 Fix] Only grant CAP_NET_BIND_SERVICE when LANDING_PORT < 1024.
+  # On a typical 8443 configuration, this cap is unnecessary (8443 > 1024).
+  # Conditional mirrors the logic already present in fresh_install CAP handling (line 3073).
+  local _cap_escaped="" _cap_bound_escaped=""
+  (( LANDING_PORT < 1024 )) && {
+    _cap_escaped="AmbientCapabilities=CAP_NET_BIND_SERVICE"
+    _cap_bound_escaped="CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+  }
   sed -i \
     -e "s|@@LANDING_USER@@|${LANDING_USER}|g" \
     -e "s|@@LANDING_CONF@@|${LANDING_CONF}|g" \
@@ -2769,14 +2775,10 @@ purge_all(){
         [[ -n "$LANDING_USER" ]] && pgrep -u "$LANDING_USER" >/dev/null 2>&1 || break
         sleep 0.5
       done
-      # [R14 Fix] userdel -r may fail silently if home is on separate FS; explicitly clean up
-      local _home; _home=$(getent passwd "$LANDING_USER" 2>/dev/null | cut -d: -f6) || true
-      if ! userdel -r "$LANDING_USER" 2>/dev/null; then
+      # [R5 Fix] Use userdel without -r — LANDING_USER was created with -M (no home dir).
+      # Passing -r causes noisy failure when /nonexistent doesn't exist or isn't removable.
+      if ! userdel "$LANDING_USER" 2>/dev/null; then
         warn "userdel 失败 (用户可能仍有运行中进程) — 需要手动清理"
-      fi
-      # Try to remove home directory even if userdel succeeded without -r
-      if [[ -n "$_home" && -d "$_home" ]]; then
-        rm -rf "$_home" 2>/dev/null || warn "无法删除用户 home 目录 $_home，请手动清理"
       fi
       groupdel "$LANDING_USER" 2>/dev/null || true
     fi

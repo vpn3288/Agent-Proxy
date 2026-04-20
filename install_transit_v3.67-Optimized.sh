@@ -950,6 +950,11 @@ trap '_fw_transit_rollback; exit 130' INT TERM
       ip6tables -w 2 -A "$FW_TMP6" -m conntrack --ctstate INVALID,UNTRACKED -j DROP
       ip6tables -w 2 -A "$FW_TMP6" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
       ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type echo-request -m limit --limit 10/second --limit-burst 20 -m comment --comment "transit-manager-icmp6" -j ACCEPT
+      # [R4 Fix] Accept critical ICMPv6 for PMTUD (type 2), dest-unreachable (1), time-exceeded (3), param-problem (4) — required for IPv6 connectivity
+      ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type destination-unreachable -m comment --comment "transit-manager-icmp6" -j ACCEPT
+      ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type packet-too-big -m comment --comment "transit-manager-icmp6-pmtud" -j ACCEPT
+      ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type time-exceeded -m comment --comment "transit-manager-icmp6" -j ACCEPT
+      ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type parameter-problem -m comment --comment "transit-manager-icmp6" -j ACCEPT
       ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type echo-request -m comment --comment "transit-manager-icmp6-drop" -j DROP
       # v2.43 Grok: IPv6 加 connlimit+rate，与 IPv4 对等防护（/64 对应 IPv6 CGNAT 粒度）
       ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT" \
@@ -1075,6 +1080,11 @@ if [ -f /proc/net/if_inet6 ] && command -v ip6tables >/dev/null 2>&1 && ip6table
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -m conntrack --ctstate INVALID,UNTRACKED -j DROP
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type echo-request -m limit --limit 10/second --limit-burst 20 -m comment --comment "transit-manager-icmp6" -j ACCEPT
+  # [R4 Fix] Accept critical ICMPv6 for PMTUD + routing control
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type destination-unreachable -m comment --comment "transit-manager-icmp6" -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type packet-too-big -m comment --comment "transit-manager-icmp6-pmtud" -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type time-exceeded -m comment --comment "transit-manager-icmp6" -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type parameter-problem -m comment --comment "transit-manager-icmp6" -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type echo-request -m comment --comment "transit-manager-icmp6-drop" -j DROP
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m connlimit --connlimit-above 2000 --connlimit-mask 64 -j DROP
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m connlimit --connlimit-above 20000 --connlimit-mask 0  -j DROP
