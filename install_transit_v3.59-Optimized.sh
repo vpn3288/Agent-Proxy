@@ -11,11 +11,9 @@ IFS=$'\n\t'
 # - 增加 mack-a 显式检测（import_token + fresh_install）
 # - detect_ssh_port() 增加 command -v sshd guard
 # - 保持 Nginx stream SNI 盲传、双栈防火墙和 mack-a 零覆盖不变
-# install_transit_v3.61-Optimized.sh — 中转机安装脚本 v3.61-Optimized
+# install_transit_v3.59-Optimized.sh — 中转机安装脚本 v3.59-Optimized
 # 版本历史：
-# v3.71-Optimized: HermesAgent cycle 7 — [BUG-B-01] Fix typo: _restore_prev_fw_traps → _restore_prev_traps (line 936)
-# v3.61-Optimized: HermesAgent cycle 6 — [R1] MANAGER_BASE guard | [R2] iptables -E die | [R3] uuid/pwd/pfx validation | [R5] .map content validation
-# v3.60-Optimized: HermesAgent cycle 5 — [R2] transit_ip validation | [R5] INPUT pos warn | [R6] ssh_port numeric | [R7] hardlinks/symlinks | [R8] duplicate domain | [R9] sysctl cleanup | [R10] IPv6 fallback | [R22] FW_CHAIN whitelist
+# v3.59-Optimized: HermesAgent cycle 4 — [R1] _route_rollback globals scope | [R5] dig +time=3 +tries=1 | [R6] SSH error msg shows invalid value
 # v3.58-Optimized: HermesAgent cycle 3 — [F4] IPv6 chain: fix INVALID DROP + correct rule order
 # v3.57-Optimized: HermesAgent cycle 2 — 架构不变，稳定性和安全加固
 # v3.56-Optimized: HermesAgent cycle 1 — 架构不变，稳定性和安全加固
@@ -46,7 +44,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 # - 将 INPUT 链清理改为行号删除，避免 save/restore 重放旧规则
 # - 修正 worker_connections 注释覆盖逻辑，防止升级标签堆叠
 # - 保持 SNI 盲传与双栈防火墙结构不变
-readonly VERSION="v3.71-Optimized"
+readonly VERSION="v3.59-Optimized"
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
@@ -84,8 +82,6 @@ find /etc/transit_manager /etc/nginx /etc/systemd/system \
 # Broad /tmp scans risk touching unrelated user files; all scratch files are now under
 # ${MANAGER_BASE}/tmp so a targeted find there is sufficient and safe.
 _global_cleanup(){
-  # [R1 Fix] Guard: refuse to delete if MANAGER_BASE is unset or empty
-  [[ -n "${MANAGER_BASE:-}" && -d "$MANAGER_BASE" ]] || return 0
   find /etc/transit_manager /etc/nginx \
     /etc/systemd/system /etc/logrotate.d \
     -maxdepth 5 \
@@ -250,9 +246,6 @@ _meta_drift_detect(){
     [[ -n "$_mdom" ]] || continue
     _msafe=$(domain_to_safe "$_mdom")
     [[ -f "${SNIPPETS_DIR}/landing_${_msafe}.map" ]] || { _bad=1; break; }
-    # [R5 Fix] Verify .map is non-empty and contains the domain (detect truncation/corruption)
-    [[ -s "${SNIPPETS_DIR}/landing_${_msafe}.map" ]] || { _bad=1; break; }
-    grep -qF "$_mdom" "${SNIPPETS_DIR}/landing_${_msafe}.map" 2>/dev/null || { _bad=1; break; }
   done < <(find "$CONF_DIR" -maxdepth 1 -type f -name '*.meta' 2>/dev/null | sort)
   return $_bad
 }
@@ -317,15 +310,8 @@ get_public_ip(){
     if (( _strict )); then
       die "无法获取中转机公网 IPv4，节点订阅无法生成。请检查网络或手动指定: TRANSIT_PUBLIC_IP=x.x.x.x bash $0 --import <token>"
     else
-      warn "无法获取中转机公网 IPv4，尝试 IPv6..."
-      for _src in "https://api6.ipify.org" "https://ifconfig.me/ip"; do
-        _ip=$(curl -6 -fsSL --connect-timeout 3 --max-time 5 --retry 2 "$_src" 2>/dev/null | tr -d '[:space:]') || true
-        [[ -n "$_ip" ]] && { warn "检测到 IPv6 地址: $_ip（中转机架构仅支持 IPv4 中转，IPv6 落地机不受支持）"; break; }
-      done
-      if [[ -z "$_ip" ]]; then
-        warn "无法获取中转机公网 IP，展示将使用占位符 <TRANSIT_IP>"
-        _ip="<TRANSIT_IP>"
-      fi
+      warn "无法获取中转机公网 IP，展示将使用占位符 <TRANSIT_IP>"
+      _ip="<TRANSIT_IP>"
     fi
   fi
   printf '%s' "$_ip"
@@ -423,11 +409,6 @@ net.ipv4.tcp_tw_reuse=1
 net.ipv4.tcp_timestamps=1
 net.ipv4.tcp_fastopen=3
 BBRCF2
-  # [R7 Fix] Defense-in-depth: protect against hardlink/symlink exploitation
-  cat >> "$bbr_conf" <<'BBRCF3'
-fs.protected_hardlinks=1
-fs.protected_symlinks=1
-BBRCF3
   # v2.42 Grok: conntrack hashsize 按内存动态计算（每条目~300B，用1/8内存）
   local _ct_mem; _ct_mem=$(free -m 2>/dev/null | awk '/Mem:/{print int($2/8*1024*1024/300)}'); _ct_mem=${_ct_mem:-262144}
   [[ "$_ct_mem" =~ ^[0-9]+$ ]] || _ct_mem=262144
@@ -932,22 +913,13 @@ trap '_fw_transit_rollback; exit 130' INT TERM
   # removes stale INPUT rules referencing old FW_CHAIN before atomic swap
   _bulldoze_input_refs_t "$FW_CHAIN"
   iptables -w 2 -F "$FW_CHAIN" 2>/dev/null || true; iptables -w 2 -X "$FW_CHAIN" 2>/dev/null || true
-  # [R2 Fix] Explicitly check rename exit code — die if chain swap fails
-  iptables -w 2 -E "$FW_TMP" "$FW_CHAIN" || {
-    _fw_transit_rollback; _restore_prev_traps; die "Chain rename failed（FW_TMP→FW_CHAIN），防火墙交换失败"
-  }
+  iptables -w 2 -E "$FW_TMP" "$FW_CHAIN"
   iptables -w 2 -I INPUT 1 -m comment --comment "transit-manager-rule" -j "$FW_CHAIN"
-  # [R5 Fix] Verify INPUT position 1 — warn (not die) since Docker/fail2ban also use position 1
-  local _actual_pos
-  _actual_pos=$(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_CHAIN" '$2==c {print $1; exit}')
-  if [[ "${_actual_pos:-}" != "1" ]]; then
-    warn "防火墙规则未能在 INPUT 链首位（实际位置: ${_actual_pos:-?}），可能与其他服务冲突"
-  fi
-  local _n
-  mapfile -t _n < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_TMP" '$2==c {print $1}' | sort -rn)
-  for _n in "${_n[@]}"; do iptables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
-  mapfile -t _n < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_CHAIN" '$2==c {print $1}' | sort -rn)
-  for _n in "${_n[@]}"; do iptables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
+    local _n
+    mapfile -t _n < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_TMP" '$2==c {print $1}' | sort -rn)
+    for _n in "${_n[@]}"; do iptables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
+    mapfile -t _n < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_CHAIN" '$2==c {print $1}' | sort -rn)
+    for _n in "${_n[@]}"; do iptables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
 
     if have_ipv6; then
       ip6tables -w 2 -N "$FW_TMP6" 2>/dev/null || ip6tables -w 2 -F "$FW_TMP6"
@@ -995,12 +967,6 @@ trap '_fw_transit_rollback; exit 130' INT TERM
 
 _persist_iptables(){
   local ssh_port="${1:-22}"
-  # [R6 Fix] Validate ssh_port is numeric before template injection
-  [[ "$ssh_port" =~ ^[0-9]+$ ]] || die "SSH 端口非法（需为数字）: $ssh_port"
-  (( ssh_port >= 1 && ssh_port <= 65535 )) || die "SSH 端口超范围 (1-65535): $ssh_port"
-  # [R22 Fix] Validate FW_CHAIN names contain only safe characters before template injection
-  [[ "$FW_CHAIN" =~ ^[A-Z0-9_-]+$ ]] || die "FW_CHAIN 含非法字符: $FW_CHAIN"
-  [[ "$FW_CHAIN6" =~ ^[A-Z0-9_-]+$ ]] || die "FW_CHAIN6 含非法字符: $FW_CHAIN6"
   mkdir -p "$MANAGER_BASE"
   local fw_script="${MANAGER_BASE}/firewall-restore.sh"
   local _fw_sig="TRANSIT_FW_VERSION=${VERSION}_$(date +%Y%m%d)"
@@ -1168,8 +1134,6 @@ _atomic_apply_route(){
   trap '_route_rollback; _restore_prev_route_traps; exit 1' INT TERM ERR
   local domain="$1" ip="$2" port="$3"
   local uuid="${4:-}" pwd="${5:-}" pfx="${6:-}"
-  # [R3 Fix] Validate uuid/pwd/pfx are non-empty before using in route
-  [[ -n "$uuid" && -n "$pwd" && -n "$pfx" ]] || die "Token 中 uuid/pwd/pfx 字段为空（格式损坏），拒绝导入"
   local safe; safe=$(domain_to_safe "$domain")
   [[ -n "$safe" ]] || die "域名 safe 转换后为空: ${domain}"
 
@@ -1295,13 +1259,6 @@ generate_nodes(){
     # NAT / 共享出口场景允许占位符输出，便于用户先拿到可继续导入的订阅模板
     transit_ip=$(get_public_ip)
   fi
-  # [R2 Fix] Validate transit_ip before using it in Python URI generation
-  if [[ "$transit_ip" != "<TRANSIT_IP>" ]]; then
-    validate_ip "$transit_ip" 2>/dev/null || {
-      warn "中转机 IP 格式非法: $transit_ip，跳过节点生成"
-      return 1
-    }
-  fi
 
   local any=0
   while IFS= read -r meta; do
@@ -1332,6 +1289,23 @@ generate_nodes(){
     printf '%s\n' "$transit_ip" "$dom" "$uuid" "$pwd" "$pfx" > "$_tmp"
     sub_b64=$(python3 - "$_tmp" 2>&1) || { _sub_err="$sub_b64"; sub_b64=""; }
     rm -f "$_tmp"
+
+    python3 - "$_tmp" >/dev/null 2>&1 <<'PYGEN'
+import base64, urllib.parse, sys
+lines = [l.strip() for l in open(sys.argv[1]).read().split('\n') if l.strip()]
+if len(lines) < 5:
+    raise SystemExit(1)
+ip, domain, vu, tp, pfx = lines[0], lines[1], lines[2], lines[3], lines[4]
+port = 443
+lbl = {'v': '[禁Mux]VLESS-Vision-', 'g': 'VLESS-gRPC-', 'w': 'VLESS-WS-', 't': 'Trojan-TCP-'}
+uris = [
+    f'vless://{vu}@{ip}:{port}?encryption=none&flow=xtls-rprx-vision&security=tls&sni={domain}&fp=chrome&type=tcp&mux=0#{urllib.parse.quote(lbl["v"]+domain)}',
+    f'vless://{vu}@{ip}:{port}?encryption=none&security=tls&sni={domain}&fp=edge&type=grpc&serviceName={pfx}-vg&alpn=h2&mode=multi#{urllib.parse.quote(lbl["g"]+domain)}',
+    f'vless://{vu}@{ip}:{port}?encryption=none&security=tls&sni={domain}&fp=firefox&type=ws&path=%2F{pfx}-vw&host={domain}&alpn=http/1.1#{urllib.parse.quote(lbl["w"]+domain)}',
+    f'trojan://{urllib.parse.quote(tp)}@{ip}:{port}?security=tls&sni={domain}&fp=safari&type=tcp#{urllib.parse.quote(lbl["t"]+domain)}',
+]
+print(base64.b64encode('\n'.join(uris).encode()).decode())
+PYGEN
 
     if [[ -n "$sub_b64" ]]; then
       echo -e "  ${BOLD}Base64 订阅（粘贴到客户端「添加订阅」）:${NC}"
@@ -1412,17 +1386,6 @@ print(decoded)
   validate_ip     "$ip"
   dom=$(trim "$dom")
   validate_domain "$dom"
-  # [R8 Fix] Check for existing domain with different IP before overwrite
-  local _existing_node
-  _existing_node=$(find "$CONF_DIR" -name "*.meta" -type f -exec grep -l "^DOMAIN=${dom}$" {} + 2>/dev/null | head -1)
-  if [[ -n "$_existing_node" ]]; then
-    local _existing_ip
-    _existing_ip=$(read_meta_ip "$_existing_node" 2>/dev/null)
-    if [[ "$_existing_ip" != "$ip" ]]; then
-      die "域名 ${dom} 已存在于节点文件 ${_existing_node}（中转IP: ${_existing_ip}），不能用不同的中转IP重复导入"
-    fi
-    warn "域名 ${dom} 已存在，将更新现有配置"
-  fi
   # v2.32 Grok: 硬截断防超长域名绕过 map 语法校验
   dom="${dom:0:253}"
   # 🔴 Grok: nginx_domain_str 过滤后若为空（含纯控制字符域名），拒绝生成 map
@@ -1773,10 +1736,6 @@ _purge_bulldoze6(){
   # iptables-save > /etc/iptables/rules.v4 已移除
 
   rm -f /etc/sysctl.d/99-transit-bbr.conf /etc/modprobe.d/nf_conntrack.conf 2>/dev/null || true
-  # [R9 Fix] Verify sysctl file deletion and reload sysctl to revert settings
-  if [[ -f /etc/sysctl.d/99-transit-bbr.conf ]]; then
-    warn "无法删除 /etc/sysctl.d/99-transit-bbr.conf（可能是只读文件系统），请手动删除"
-  fi
   sysctl --system &>/dev/null || true
   sed -i '/# xray-transit: raised for high-concurrency/,/^root hard nofile/d' /etc/security/limits.conf 2>/dev/null || true
   rm -f /var/run/transit-manager.update.warn 2>/dev/null || true

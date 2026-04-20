@@ -11,10 +11,8 @@ IFS=$'\n\t'
 # - 增加 mack-a 显式检测（import_token + fresh_install）
 # - detect_ssh_port() 增加 command -v sshd guard
 # - 保持 Nginx stream SNI 盲传、双栈防火墙和 mack-a 零覆盖不变
-# install_transit_v3.61-Optimized.sh — 中转机安装脚本 v3.61-Optimized
+# install_transit_v3.60-Optimized.sh — 中转机安装脚本 v3.60-Optimized
 # 版本历史：
-# v3.71-Optimized: HermesAgent cycle 7 — [BUG-B-01] Fix typo: _restore_prev_fw_traps → _restore_prev_traps (line 936)
-# v3.61-Optimized: HermesAgent cycle 6 — [R1] MANAGER_BASE guard | [R2] iptables -E die | [R3] uuid/pwd/pfx validation | [R5] .map content validation
 # v3.60-Optimized: HermesAgent cycle 5 — [R2] transit_ip validation | [R5] INPUT pos warn | [R6] ssh_port numeric | [R7] hardlinks/symlinks | [R8] duplicate domain | [R9] sysctl cleanup | [R10] IPv6 fallback | [R22] FW_CHAIN whitelist
 # v3.58-Optimized: HermesAgent cycle 3 — [F4] IPv6 chain: fix INVALID DROP + correct rule order
 # v3.57-Optimized: HermesAgent cycle 2 — 架构不变，稳定性和安全加固
@@ -46,7 +44,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 # - 将 INPUT 链清理改为行号删除，避免 save/restore 重放旧规则
 # - 修正 worker_connections 注释覆盖逻辑，防止升级标签堆叠
 # - 保持 SNI 盲传与双栈防火墙结构不变
-readonly VERSION="v3.71-Optimized"
+readonly VERSION="v3.60-Optimized"
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
@@ -84,8 +82,6 @@ find /etc/transit_manager /etc/nginx /etc/systemd/system \
 # Broad /tmp scans risk touching unrelated user files; all scratch files are now under
 # ${MANAGER_BASE}/tmp so a targeted find there is sufficient and safe.
 _global_cleanup(){
-  # [R1 Fix] Guard: refuse to delete if MANAGER_BASE is unset or empty
-  [[ -n "${MANAGER_BASE:-}" && -d "$MANAGER_BASE" ]] || return 0
   find /etc/transit_manager /etc/nginx \
     /etc/systemd/system /etc/logrotate.d \
     -maxdepth 5 \
@@ -250,9 +246,6 @@ _meta_drift_detect(){
     [[ -n "$_mdom" ]] || continue
     _msafe=$(domain_to_safe "$_mdom")
     [[ -f "${SNIPPETS_DIR}/landing_${_msafe}.map" ]] || { _bad=1; break; }
-    # [R5 Fix] Verify .map is non-empty and contains the domain (detect truncation/corruption)
-    [[ -s "${SNIPPETS_DIR}/landing_${_msafe}.map" ]] || { _bad=1; break; }
-    grep -qF "$_mdom" "${SNIPPETS_DIR}/landing_${_msafe}.map" 2>/dev/null || { _bad=1; break; }
   done < <(find "$CONF_DIR" -maxdepth 1 -type f -name '*.meta' 2>/dev/null | sort)
   return $_bad
 }
@@ -932,10 +925,7 @@ trap '_fw_transit_rollback; exit 130' INT TERM
   # removes stale INPUT rules referencing old FW_CHAIN before atomic swap
   _bulldoze_input_refs_t "$FW_CHAIN"
   iptables -w 2 -F "$FW_CHAIN" 2>/dev/null || true; iptables -w 2 -X "$FW_CHAIN" 2>/dev/null || true
-  # [R2 Fix] Explicitly check rename exit code — die if chain swap fails
-  iptables -w 2 -E "$FW_TMP" "$FW_CHAIN" || {
-    _fw_transit_rollback; _restore_prev_traps; die "Chain rename failed（FW_TMP→FW_CHAIN），防火墙交换失败"
-  }
+  iptables -w 2 -E "$FW_TMP" "$FW_CHAIN"
   iptables -w 2 -I INPUT 1 -m comment --comment "transit-manager-rule" -j "$FW_CHAIN"
   # [R5 Fix] Verify INPUT position 1 — warn (not die) since Docker/fail2ban also use position 1
   local _actual_pos
@@ -1168,8 +1158,6 @@ _atomic_apply_route(){
   trap '_route_rollback; _restore_prev_route_traps; exit 1' INT TERM ERR
   local domain="$1" ip="$2" port="$3"
   local uuid="${4:-}" pwd="${5:-}" pfx="${6:-}"
-  # [R3 Fix] Validate uuid/pwd/pfx are non-empty before using in route
-  [[ -n "$uuid" && -n "$pwd" && -n "$pfx" ]] || die "Token 中 uuid/pwd/pfx 字段为空（格式损坏），拒绝导入"
   local safe; safe=$(domain_to_safe "$domain")
   [[ -n "$safe" ]] || die "域名 safe 转换后为空: ${domain}"
 
@@ -1332,6 +1320,23 @@ generate_nodes(){
     printf '%s\n' "$transit_ip" "$dom" "$uuid" "$pwd" "$pfx" > "$_tmp"
     sub_b64=$(python3 - "$_tmp" 2>&1) || { _sub_err="$sub_b64"; sub_b64=""; }
     rm -f "$_tmp"
+
+    python3 - "$_tmp" >/dev/null 2>&1 <<'PYGEN'
+import base64, urllib.parse, sys
+lines = [l.strip() for l in open(sys.argv[1]).read().split('\n') if l.strip()]
+if len(lines) < 5:
+    raise SystemExit(1)
+ip, domain, vu, tp, pfx = lines[0], lines[1], lines[2], lines[3], lines[4]
+port = 443
+lbl = {'v': '[禁Mux]VLESS-Vision-', 'g': 'VLESS-gRPC-', 'w': 'VLESS-WS-', 't': 'Trojan-TCP-'}
+uris = [
+    f'vless://{vu}@{ip}:{port}?encryption=none&flow=xtls-rprx-vision&security=tls&sni={domain}&fp=chrome&type=tcp&mux=0#{urllib.parse.quote(lbl["v"]+domain)}',
+    f'vless://{vu}@{ip}:{port}?encryption=none&security=tls&sni={domain}&fp=edge&type=grpc&serviceName={pfx}-vg&alpn=h2&mode=multi#{urllib.parse.quote(lbl["g"]+domain)}',
+    f'vless://{vu}@{ip}:{port}?encryption=none&security=tls&sni={domain}&fp=firefox&type=ws&path=%2F{pfx}-vw&host={domain}&alpn=http/1.1#{urllib.parse.quote(lbl["w"]+domain)}',
+    f'trojan://{urllib.parse.quote(tp)}@{ip}:{port}?security=tls&sni={domain}&fp=safari&type=tcp#{urllib.parse.quote(lbl["t"]+domain)}',
+]
+print(base64.b64encode('\n'.join(uris).encode()).decode())
+PYGEN
 
     if [[ -n "$sub_b64" ]]; then
       echo -e "  ${BOLD}Base64 订阅（粘贴到客户端「添加订阅」）:${NC}"

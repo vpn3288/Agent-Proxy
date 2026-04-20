@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
-# install_landing_v3.63.sh — 落地机安装脚本 v3.63
+# install_landing_v3.58.sh — 落地机安装脚本 v3.58
 # 版本历史：
-# v3.63: HermesAgent cycle 6 — [R9] pre-export port validation(C) | [R10] reload script check | [R12] Vision mux validation | [R14] home dir cleanup | [R16] Python timeout
-# v3.62: HermesAgent cycle 5 — [R11] DNS wait trap | [R12] CERT_DIR validation | [R13] empty content check | [R14] dup IP warn | [R15] ControlGroups | [R17] password consistency | [R18] cert mon del verify | [R19] port conflict | [R20] UUID fallback | [R21] CF Zone ID | [R23] mack-a msg
-# v3.60: HermesAgent cycle 3 — [F1] TROJAN_GRPC port=0 bug | [F2] _bulldoze awk parse | [F3] _CAP_BOUND unbound in do_set_port
 # v3.58: HermesAgent cycle 1 — [H-1] 修复域名连续点校验 | [H-2] 增加落地机 mack-a 检测
 # v3.57: 修复 acme.sh --issue 前 DNS 传播等待逻辑（首次申请前也等待）
 # v3.56: 优化证书申请重试策略，增加 DNS TXT 记录传播主动探测
@@ -118,7 +115,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 # - 修复 acme.sh 首次安装下载/执行缺失，恢复证书申请链路
 # - 将 INPUT 链清理改为行号删除，避免 save/restore 重放旧规则
 # - 修正 nginx worker_connections 注释覆盖逻辑，防止升级标签堆叠
-readonly VERSION="v3.63"
+readonly VERSION="v3.58"
 # v2.17: Gemini审计修复·gRPC fallback使用纯ALPN匹配
 # v2.15: 初始稳定版本
 
@@ -381,7 +378,7 @@ detect_ssh_port(){
     if [[ "${detect_ssh_port_override:-}" =~ ^[0-9]+$ ]] && (( detect_ssh_port_override >= 1 && detect_ssh_port_override <= 65535 )); then
       p="$detect_ssh_port_override"
     else
-      echo -e "${RED}[FATAL]${NC} 无法探测 SSH 端口（sshd -T 和 ss 均失败）。环境变量 detect_ssh_port_override='${detect_ssh_port_override:-<未设置>}' 无效（需为 1-65535 的数字）。" >&2
+      echo -e "${RED}[FATAL]${NC} 无法探测 SSH 端口（sshd -T 和 ss 均失败）。请以 detect_ssh_port_override=<端口> 环境变量指定后重试。" >&2
       exit 1
     fi
   fi
@@ -699,7 +696,7 @@ _tune_nginx_worker_connections(){
       warn "nginx.conf tuning validation failed — restoring snapshot"
       # [F1] Hard-fail restore: if mv fails, try cp -a; if both fail, system is broken
       if ! mv -f "$_mc_bak" "$mc" 2>/dev/null; then
-        cp -a "$_mc_bak" "$mc" || { cp "$_mc_bak" "${mc}.backup-$(date +%s)" 2>/dev/null || true; die "nginx.conf restore FAILED — backup saved, manual fix needed"; }
+        cp -a "$_mc_bak" "$mc" || die "nginx.conf restore FAILED — file may be corrupted; manual fix needed"
       fi
       die "nginx.conf tuning failed; original config restored"
     fi
@@ -816,11 +813,7 @@ _write_cert_reload_script(){
 # xray-landing-reload-v\${VERSION}
 set -eu
 CERT_DIR="\${1:-}"
-# [R12 Fix] Validate CERT_DIR is non-empty AND exists before any chown/chmod operations
-if [ -z "\$CERT_DIR" ] || [ ! -d "\$CERT_DIR" ]; then
-  logger -t acme-xray-landing "ERROR: Invalid CERT_DIR: '\$CERT_DIR'"
-  exit 1
-fi
+[ -n "\$CERT_DIR" ] || exit 0
 
 # [v2.15 Bug Fix] acme.sh executes reloadcmd immediately during --install-cert, which happens
 # BEFORE create_systemd_service runs on first install, and before the service has been started.
@@ -839,9 +832,10 @@ chmod 644 "\$CERT_DIR/cert.pem" "\$CERT_DIR/fullchain.pem" || true
 chmod 640 "\$CERT_DIR/key.pem" || true
 
 if openssl x509 -checkend 86400 -noout -in "\${CERT_DIR}/fullchain.pem" 2>/dev/null; then
-  # 证书有效：Xray 需要 restart 加载新证书（reload 对 Xray 无效），使用 restart 避免 StartLimitBurst 消耗
-  # [v2.10 Architect-🟠] Restart is the correct behavior for Xray cert reload. The reload attempt first
-  # is for future-proofing if Xray ever supports in-place reload, but restart is the actual fallback.
+  # 证书有效：SIGHUP reload（不中断连接，不消耗 StartLimitBurst 预算）
+  # [v2.10 Architect-🟠] Reload-only: the health-probe-triggered restart in v2.9 could turn
+  # a routine renewal into a live-session disruption. If reload leaves the service dead,
+  # OnFailure=xray-landing-recovery.service handles restart with proper rate-limiting.
   if ! /bin/systemctl reload xray-landing.service 2>/dev/null; then
     # [v2.32 Fix] reload失败时尝试一次restart，再失败才退出
     logger -t acme-xray-landing "WARN: reload failed — attempting restart"
@@ -863,14 +857,6 @@ RELOAD_EOF
 issue_certificate(){
   local domain="$1" cf_token="$2"
   local cert_dir="${CERT_BASE}/${domain}"
-
-  # [R21 Fix] Validate CF token has Zone:DNS:Edit permission before wasting ACME attempts
-  local _zone_id
-  _zone_id=$(curl -fsSL --connect-timeout 5 --max-time 10     -H "Authorization: Bearer $cf_token"     "https://api.cloudflare.com/client/v4/zones?name=${domain#*.}"     2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['result'][0]['id'] if d.get('result') else '')" 2>/dev/null) || true
-  if [[ -z "$_zone_id" ]]; then
-    die "Cloudflare API Token 验证失败（无法获取 Zone ID），请检查 Token 权限（需要 Zone:DNS:Edit）"
-  fi
-  info "Cloudflare Zone ID: $_zone_id（Token 验证通过）"
 
   if [[ -f "${cert_dir}/fullchain.pem" && -f "${cert_dir}/key.pem" ]]; then
     local end_str; end_str=$(openssl x509 -in "${cert_dir}/fullchain.pem" -noout -enddate 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || true
@@ -944,13 +930,10 @@ issue_certificate(){
 
 _wait_dns_txt(){
     local _d="$1" _max=120 _step=20 _elapsed=0
-    # [R11 Fix] Trap INT/TERM during DNS wait to prevent premature ACME attempt
-    trap 'echo ""; warn "DNS 等待被中断（请等待传播完成后再试）"; sleep 2; trap - INT TERM; return 1' INT TERM
     info "等待 DNS TXT 传播（主动探测 _acme-challenge.${_d}，最长 ${_max}s）..."
     while (( _elapsed < _max )); do
-      if dig +short +time=3 +tries=1 TXT "_acme-challenge.${_d}" 2>/dev/null | sed '/^$/d' | grep -q .; then
+      if dig +short TXT "_acme-challenge.${_d}" 2>/dev/null | sed '/^$/d' | grep -q .; then
         printf '\n%s\n' "${GREEN}[OK]${NC}    DNS TXT 已检测到，继续申请证书..."
-        trap - INT TERM
         return 0
       fi
       local _i=$_step
@@ -963,7 +946,6 @@ _wait_dns_txt(){
     done
     printf '\n'
     warn "DNS 传播等待超时（${_max}s），acme.sh 将自行处理"
-    trap - INT TERM
     return 1
 }
 # [Doc4-3] DNS-01 (dns_cf) 模式通过 Cloudflare API 修改 TXT 记录，完全不需要占用 80 端口
@@ -974,8 +956,7 @@ for try in 1 2; do
     local _force_opt=""
     (( try > 1 )) && _force_opt="--force"
     # [R2 Fix] Wait for DNS propagation BEFORE first issuance attempt (not just between retries)
-    # [R5 Partial Fix] Die on DNS timeout before first attempt — don't waste ACME attempts
-    (( try == 1 )) && ! _wait_dns_txt "$domain" && die "DNS TXT 记录在 120 秒内未传播，终止证书申请（请等待后重试）"
+    (( try == 1 )) && _wait_dns_txt "$domain"
     CF_Token="$cf_token" "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --issue --dns dns_cf \
       --domain "$domain" --keylength ec-256 \
       --server letsencrypt \
@@ -1042,12 +1023,6 @@ for try in 1 2; do
   atomic_write "/etc/cron.daily/xray-cert-monitor" 755 root:root <<'MEOF'
 #!/bin/sh
 # xray-cert-monitor — 独立证书寿命哨兵，由 xray-landing 脚本管理
-# [R10 Fix] Verify reload script exists before proceeding
-if [ ! -x "/usr/local/bin/xray-landing-cert-reload.sh" ]; then
-  logger -t xray-cert-monitor "FATAL: reload script missing; renewals will fail"
-  echo "$(date '+%Y-%m-%d %H:%M:%S') FATAL: reload script missing" >> /var/log/acme-xray-landing-renew.log 2>/dev/null || true
-  exit 1
-fi
 # 7天内过期则告警（logger + renew.log + profile.d SSH登录劫持）
 # 完全独立于 acme.sh 回调路径，防续期连续失败时系统静默
 # [v2.7 Gemini-Doc1-🔴] Also runs systemctl reset-failed on expiry detection:
@@ -1120,15 +1095,15 @@ sync_xray_config(){
     export _CFG_OUT="$LANDING_CONF"
     export _LANDING_PORT="$LANDING_PORT"
     export _VLESS_UUID="$VLESS_UUID"
-    # [R9 Fix] Validate BEFORE export — non-numeric values must die before Python inherits them
-    for _p in "$VLESS_GRPC_PORT" "$TROJAN_GRPC_PORT" "$VLESS_WS_PORT" "$TROJAN_TCP_PORT"; do
-      [[ "$_p" =~ ^[0-9]+$ ]] || die "内部端口 '$_p' 非数字（manager.conf 损坏），拒绝启动"
-    done
     export _VLESS_GRPC_PORT="$VLESS_GRPC_PORT"
     export _TROJAN_GRPC_PORT="$TROJAN_GRPC_PORT"
     export _VLESS_WS_PORT="$VLESS_WS_PORT"
     export _TROJAN_TCP_PORT="$TROJAN_TCP_PORT"
     export _BIND_IP="$BIND_IP"
+    [[ "$VLESS_GRPC_PORT" =~ ^[0-9]+$ ]] || die "VLESS_GRPC_PORT non-numeric: $VLESS_GRPC_PORT"
+    [[ "$TROJAN_GRPC_PORT" =~ ^[0-9]+$ ]] || die "TROJAN_GRPC_PORT non-numeric: $TROJAN_GRPC_PORT"
+    [[ "$VLESS_WS_PORT" =~ ^[0-9]+$ ]] || die "VLESS_WS_PORT non-numeric: $VLESS_WS_PORT"
+    [[ "$TROJAN_TCP_PORT" =~ ^[0-9]+$ ]] || die "TROJAN_TCP_PORT non-numeric: $TROJAN_TCP_PORT"
     python3 - <<'PYEOF'
 import json, os, glob, uuid as _uuid, random as _rand
 
@@ -1163,13 +1138,6 @@ for path in sorted(glob.glob(os.path.join(nodes_dir, '*.conf'))):
     # dest file; treat as corruption to force bash die() + rollback via non-zero exit.
     if os.path.getsize(path) == 0:
         raise ValueError(f"Zero-byte node file detected: {path}")
-    # [R13 Fix] Also check for non-zero files that contain only whitespace or comments
-    try:
-        file_content = Path(path).read_text(encoding='utf-8', errors='replace').strip()
-        if not file_content or file_content.startswith('#'):
-            raise ValueError(f"Node file contains no valid data: {path}")
-    except OSError as e:
-        raise ValueError(f"Cannot read node file {path}: {e}")
     dom = pwd = ''
     try:
         for line in open(path, encoding='utf-8', errors='replace'):
@@ -1389,7 +1357,6 @@ User=@@LANDING_USER@@
 NoNewPrivileges=true
 ExecStartPre=/bin/sh -c 'test -f @@LANDING_CONF@@ || { echo "config.json missing"; exit 1; }'
 ExecStartPre=/bin/sh -c 'python3 -c "import json,sys; json.load(open(sys.argv[1]))" @@LANDING_CONF@@ 2>/dev/null || { echo "config.json invalid JSON"; exit 1; }'
-ExecStartPre=/bin/sh -c 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); vision=[i for i in d[\"inbounds\"] if \"flow\" in str(i.get(\"settings\",{}).get(\"clients\",[{}])[0])]; sys.exit(1 if any(\"mux\" in str(i) for i in vision) else 0)" @@LANDING_CONF@@ 2>/dev/null || { echo "Vision inbound has mux enabled (unsupported with flow=xtls-rprx-vision)"; exit 1; }'
 @@CAP_LINE@@
 @@CAP_BOUND@@
 ExecStart=@@LANDING_BIN@@ run -config @@LANDING_CONF@@
@@ -1409,7 +1376,6 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectKernelLogs=true
 ProtectKernelTunables=true
-ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ProtectClock=true
 LockPersonality=true
@@ -1430,10 +1396,13 @@ SVCEOF
   (( _svc_fd > 10485760 )) && _svc_fd=10485760
 
   # sed-inject 所有运行时路径（占位符方式，绕过 heredoc 变量展开问题）
-  # [R17 Fix] Always grant CAP_NET_BIND_SERVICE — fallback ports (45231/45232) are <1024
-  # regardless of LANDING_PORT value, and Xray needs this cap to bind them.
-  local _cap_escaped="AmbientCapabilities=CAP_NET_BIND_SERVICE"
-  local _cap_bound_escaped="CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+  local _cap_escaped
+  if (( LANDING_PORT < 1024 )); then
+    _cap_escaped="AmbientCapabilities=CAP_NET_BIND_SERVICE"
+  else
+    _cap_escaped=""
+  fi
+  local _cap_bound_escaped; _cap_bound_escaped=$(printf '%s' "${_CAP_BOUND}" | sed 's/[\\/&]/\\&/g')
   sed -i \
     -e "s|@@LANDING_USER@@|${LANDING_USER}|g" \
     -e "s|@@LANDING_CONF@@|${LANDING_CONF}|g" \
@@ -1462,7 +1431,6 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ProtectKernelTunables=true
-ProtectControlGroups=true
 XRAYLIMITS
 
   # v2.47 Gemini: recovery unit — diagnostic + conditional auto-restart with preflight
@@ -1553,14 +1521,14 @@ setup_firewall(){
   # references FW_CHAIN or FW_TMP by name before attempting -F / -X / -E.
   _bulldoze_input_refs(){
     local _chain="$1" _lines _n
-    mapfile -t _lines < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_chain" '$2==c {print $1}' | sort -rn)
+    mapfile -t _lines < <(iptables -w 2 -S INPUT 2>/dev/null | awk -v c="$_chain" 'index($0, "-j " c) {split($1,a,":"); print a[1]}' | sort -rn)
     for _n in "${_lines[@]}"; do
       iptables -w 2 -D INPUT "$_n" 2>/dev/null || true
     done
   }
   _bulldoze_input_refs6(){
     local _chain="$1" _lines _n
-    mapfile -t _lines < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_chain" '$2==c {print $1}' | sort -rn)
+    mapfile -t _lines < <(ip6tables -w 2 -S INPUT 2>/dev/null | awk -v c="$_chain" 'index($0, "-j " c) {split($1,a,":"); print a[1]}' | sort -rn)
     for _n in "${_lines[@]}"; do
       ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true
     done
@@ -1604,27 +1572,14 @@ setup_firewall(){
     if [[ -z "$tip" ]]; then
       warn "  [跳过] 节点文件 ${meta} 缺少 TRANSIT_IP 字段"; (( ++skipped )) || true; continue
     fi
-    # [R16 Fix] Add 5s timeout to Python call — prevents indefinite hang if Python is broken
-    if ! printf '%s' "$tip" | timeout 5 python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null; then
-      warn "  [跳过] 节点文件 ${meta} TRANSIT_IP='${tip}' 格式非法或 Python 无响应"; (( ++skipped )) || true; continue
+    if ! printf '%s' "$tip" | python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null; then
+      warn "  [跳过] 节点文件 ${meta} TRANSIT_IP='${tip}' 格式非法"; (( ++skipped )) || true; continue
     fi
     tips+=("$tip")
   done
   if (( skipped > 0 )); then
-    die "防火墙构建中止：${skipped} 个节点文件格式异常，拒绝生成可能放行不足的规则集（预期 ${#_conf_files[@]}，有效 $(( ${#_conf_files[@]} - skipped ))）"
+    die "防火墙构建中止：${skipped} 个节点文件格式异常，拒绝生成可能放行不足的规则集（预期 ${#metas[@]}，有效 $(( ${#metas[@]} - skipped ))）"
   fi
-  # [R14 Fix] Warn about duplicate transit IPs (multiple domains on same transit is normal)
-  local _seen_ips=() _dup_found=0
-  for _tip in "${tips[@]}"; do
-    for _seen in "${_seen_ips[@]}"; do
-      if [[ "$_seen" == "$_tip" ]]; then
-        warn "检测到重复的中转IP: $_tip（多个域名共享同一中转机，正常）"
-        _dup_found=1
-        break
-      fi
-    done
-    _seen_ips+=("$_tip")
-  done
   # Now safe to start iptables operations
   iptables -w 2 -N "$FW_TMP" 2>/dev/null || iptables -w 2 -F "$FW_TMP"
   # v2.32 Grok: lo + SSH 先于 INVALID,UNTRACKED 放行，conntrack 表满时 SSH 不断
@@ -1696,8 +1651,7 @@ _persist_iptables(){
   while IFS= read -r meta; do
     [[ -f "$meta" ]] || continue
     local tip; tip=$(grep '^TRANSIT_IP=' "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || continue
-    # [R16 Fix] Add 5s timeout to Python call
-    printf '%s' "$tip" | timeout 5 python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null && transit_ips+=("$tip") || true
+    printf '%s' "$tip" | python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null && transit_ips+=("$tip") || true
   done < <(find "${MANAGER_BASE}/nodes" -name "*.conf" -not -name "tmp-*.conf" -type f 2>/dev/null | sort)
 
   local _fw_sig="LANDING_FW_VERSION=${VERSION}_$(date +%Y%m%d)"
@@ -1733,8 +1687,8 @@ _detect_ssh(){
   if echo "$p" | grep -qE '^[0-9]+$' && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
     echo "$p"
   else
-    logger -t xray-landing-firewall "ERROR: 无法动态探测SSH端口，拒绝开机恢复（安全策略：禁止回退到可能过时的安装时端口）"
-    exit 1
+    logger -t xray-landing-firewall "WARN: 无法动态探测SSH端口，使用安装时值 __SSH_PORT__"
+    echo "__SSH_PORT__"
   fi
 }
 SSH_PORT="$(_detect_ssh)"
@@ -1890,10 +1844,6 @@ PYNODE
 ) || true
   fi
   if [[ -n "$existing_pass" ]]; then
-    # [R17 Fix] If user provided a different password than existing, die
-    if [[ -n "${NEW_PASS:-}" && "$NEW_PASS" != "$existing_pass" ]]; then
-      die "节点文件已存在但密码不一致（旧: ${existing_pass:0:8}...，新: ${NEW_PASS:0:8}...），请先删除旧节点或留空以沿用现有密码"
-    fi
     warn "域名 ${NEW_DOMAIN} 已存在，新中转机必须复用相同 Trojan 密码"
     NEW_PASS="$existing_pass"
     info "  自动沿用密码: ${NEW_PASS}"
@@ -2219,12 +2169,6 @@ do_set_port(){
   [[ -n "$new_port" ]] || { read -rp "新落地机监听端口: " new_port; }
   validate_port "$new_port"
   (( new_port >= 1024 )) || die "端口 ${new_port} 小于 1024，set-port 不支持低端口（需重装以更新权限配置）"
-  # [R19 Fix] Check for conflict with internal ports (VLESS_GRPC, TROJAN_GRPC, VLESS_WS, TROJAN_TCP)
-  for _internal_port in "$VLESS_GRPC_PORT" "$TROJAN_GRPC_PORT" "$VLESS_WS_PORT" "$TROJAN_TCP_PORT"; do
-    if [[ "${_internal_port:-}" =~ ^[0-9]+$ && "${_internal_port}" == "$new_port" ]]; then
-      die "端口 ${new_port} 与内部端口冲突（${_internal_port}），请选择其他端口"
-    fi
-  done
   if [[ "$new_port" == "$LANDING_PORT" ]]; then
     success "端口已是 ${new_port}，无需变更"; return
   fi
@@ -2741,9 +2685,6 @@ purge_all(){
   rm -rf "$MANAGER_BASE" 2>/dev/null || true
   rm -f /etc/sysctl.d/99-landing-bbr.conf /etc/modprobe.d/99-landing-conntrack.conf 2>/dev/null || true
   rm -f /etc/cron.daily/xray-cert-monitor 2>/dev/null || true
-  if [[ -f /etc/cron.daily/xray-cert-monitor ]]; then
-    warn "无法删除 /etc/cron.daily/xray-cert-monitor（可能是只读文件系统），请手动删除"
-  fi
   if [[ -f "$NGINX_CONF_ORIG" ]]; then
     cp -a "$NGINX_CONF_ORIG" /etc/nginx/nginx.conf 2>/dev/null || true
   else
@@ -2763,14 +2704,8 @@ purge_all(){
         [[ -n "$LANDING_USER" ]] && pgrep -u "$LANDING_USER" >/dev/null 2>&1 || break
         sleep 0.5
       done
-      # [R14 Fix] userdel -r may fail silently if home is on separate FS; explicitly clean up
-      local _home; _home=$(getent passwd "$LANDING_USER" 2>/dev/null | cut -d: -f6) || true
       if ! userdel -r "$LANDING_USER" 2>/dev/null; then
         warn "userdel 失败 (用户可能仍有运行中进程) — 需要手动清理"
-      fi
-      # Try to remove home directory even if userdel succeeded without -r
-      if [[ -n "$_home" && -d "$_home" ]]; then
-        rm -rf "$_home" 2>/dev/null || warn "无法删除用户 home 目录 $_home，请手动清理"
       fi
       groupdel "$LANDING_USER" 2>/dev/null || true
     fi
@@ -2925,8 +2860,6 @@ fresh_install(){
   ss -tlnp 2>/dev/null | grep -q ":${LANDING_PORT} " && die "端口 ${LANDING_PORT} 已被占用（请先检查 nginx / xray* / mack-a*）"
   # [HermesAgent] mack-a detection for landing node
   if command -v mack-a &>/dev/null || [[ -f /etc/v2ray-agent/install.sh ]]; then
-    # [R23 Fix] Explicitly tell user to stop mack-a services when port conflict detected
-    ss -tlnp 2>/dev/null | grep -q ":443 " && die "443 端口已被占用！检测到 mack-a 已安装，请先执行: systemctl stop xray nginx v2ray 后再安装"
     warn "检测到 mack-a 已安装，本落地机将与其共享端口，请确认无冲突"
   fi
   __LANDING_FRESH_INSTALL_TRAP_ACTIVE=1
@@ -2967,22 +2900,22 @@ fresh_install(){
         success "已复用旧 UUID 和端口，现有订阅链接继续有效"
       else
         warn "  将生成全新 UUID（旧订阅链接将全部失效！）"
-        VLESS_UUID=$(python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null)           || VLESS_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true) || VLESS_UUID=$(uuidgen 2>/dev/null) || die "无法生成 UUID（python3 uuid、/proc/sys/kernel/random/uuid、uuidgen 均失败）"
+        VLESS_UUID=$(python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null)           || VLESS_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)
       fi
     fi
   else
-    VLESS_UUID=$(python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null)       || VLESS_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true) || VLESS_UUID=$(uuidgen 2>/dev/null) || die "无法生成 UUID（python3 uuid、/proc/sys/kernel/random/uuid、uuidgen 均失败）"
+    VLESS_UUID=$(python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null)       || VLESS_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)
   fi
 
   # 只在端口为默认值0时才重新分配（复用路径已赋值，新装路径仍随机分配）
-  local _VGRPC="${VLESS_GRPC_PORT:-0}" _VTG="${TROJAN_GRPC_PORT:-0}" _VWS="${VLESS_WS_PORT:-0}" _TTCP="${TROJAN_TCP_PORT:-0}"
+  local _VGRPC="${VLESS_GRPC_PORT:-0}" _VWS="${VLESS_WS_PORT:-0}" _TTCP="${TROJAN_TCP_PORT:-0}"
   if [[ "${VLESS_GRPC_PORT:-0}" == "0" ]]; then
     _VGRPC=$(python3 -c "import random; b=random.randint(21000,29000)&~3; print(b)")
-    _VTG=$(( _VGRPC + 1 )); _VWS=$(( _VGRPC + 2 )); _TTCP=$(( _VGRPC + 3 ))
-    VLESS_GRPC_PORT="$_VGRPC"; TROJAN_GRPC_PORT="$_VTG"; VLESS_WS_PORT="$_VWS"; TROJAN_TCP_PORT="$_TTCP"
+    _VWS=$(( _VGRPC + 1 )); _TTCP=$(( _VGRPC + 2 ))
+    VLESS_GRPC_PORT="$_VGRPC"; VLESS_WS_PORT="$_VWS"; TROJAN_TCP_PORT="$_TTCP"
   fi
   _validate_internal_ports_in_use
-  for _chkp in "$_VGRPC" "$_VTG" "$_VWS" "$_TTCP"; do
+  for _chkp in "$_VGRPC" "$_TTCP" "$_VWS"; do
     ss -tlnp 2>/dev/null | grep -q ":${_chkp} "       && { warn "内网端口 ${_chkp} 已被占用，请重新运行脚本（自动重新分配）"; false; }
   done
 
@@ -3077,7 +3010,6 @@ SMFI
       rm -rf "${CERT_BASE}/${DOMAIN}" 2>/dev/null || true
     fi
     rm -f "$_final_node" "${_staged_fi_mgr:-}" 2>/dev/null || true
-    _release_lock; exit 1
   fi
   if ! ( create_systemd_service ); then
     if [[ -f "${ACME_HOME}/acme.sh" ]]; then
@@ -3085,7 +3017,6 @@ SMFI
       rm -rf "${CERT_BASE}/${DOMAIN}" 2>/dev/null || true
     fi
     rm -f "$_final_node" "${_staged_fi_mgr:-}" 2>/dev/null || true
-    _release_lock; exit 1
   fi
 
   # Node file already at final path; reset trap to standard
@@ -3106,7 +3037,7 @@ SMFI
       "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --remove --domain "$DOMAIN" --ecc 2>/dev/null || true
       rm -rf "${CERT_BASE}/${DOMAIN}" 2>/dev/null || true
     fi
-    _release_lock; exit 1
+    true
   fi
 
   # [v2.9 Grok-A-🟠] Touch INSTALLED_FLAG *before* mv staged_fi_mgr.

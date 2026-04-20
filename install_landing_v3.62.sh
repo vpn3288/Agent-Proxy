@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
-# install_landing_v3.63.sh — 落地机安装脚本 v3.63
+# install_landing_v3.62.sh — 落地机安装脚本 v3.62
 # 版本历史：
-# v3.63: HermesAgent cycle 6 — [R9] pre-export port validation(C) | [R10] reload script check | [R12] Vision mux validation | [R14] home dir cleanup | [R16] Python timeout
 # v3.62: HermesAgent cycle 5 — [R11] DNS wait trap | [R12] CERT_DIR validation | [R13] empty content check | [R14] dup IP warn | [R15] ControlGroups | [R17] password consistency | [R18] cert mon del verify | [R19] port conflict | [R20] UUID fallback | [R21] CF Zone ID | [R23] mack-a msg
 # v3.60: HermesAgent cycle 3 — [F1] TROJAN_GRPC port=0 bug | [F2] _bulldoze awk parse | [F3] _CAP_BOUND unbound in do_set_port
 # v3.58: HermesAgent cycle 1 — [H-1] 修复域名连续点校验 | [H-2] 增加落地机 mack-a 检测
@@ -118,7 +117,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 # - 修复 acme.sh 首次安装下载/执行缺失，恢复证书申请链路
 # - 将 INPUT 链清理改为行号删除，避免 save/restore 重放旧规则
 # - 修正 nginx worker_connections 注释覆盖逻辑，防止升级标签堆叠
-readonly VERSION="v3.63"
+readonly VERSION="v3.62"
 # v2.17: Gemini审计修复·gRPC fallback使用纯ALPN匹配
 # v2.15: 初始稳定版本
 
@@ -699,7 +698,7 @@ _tune_nginx_worker_connections(){
       warn "nginx.conf tuning validation failed — restoring snapshot"
       # [F1] Hard-fail restore: if mv fails, try cp -a; if both fail, system is broken
       if ! mv -f "$_mc_bak" "$mc" 2>/dev/null; then
-        cp -a "$_mc_bak" "$mc" || { cp "$_mc_bak" "${mc}.backup-$(date +%s)" 2>/dev/null || true; die "nginx.conf restore FAILED — backup saved, manual fix needed"; }
+        cp -a "$_mc_bak" "$mc" || die "nginx.conf restore FAILED — file may be corrupted; manual fix needed"
       fi
       die "nginx.conf tuning failed; original config restored"
     fi
@@ -1042,12 +1041,6 @@ for try in 1 2; do
   atomic_write "/etc/cron.daily/xray-cert-monitor" 755 root:root <<'MEOF'
 #!/bin/sh
 # xray-cert-monitor — 独立证书寿命哨兵，由 xray-landing 脚本管理
-# [R10 Fix] Verify reload script exists before proceeding
-if [ ! -x "/usr/local/bin/xray-landing-cert-reload.sh" ]; then
-  logger -t xray-cert-monitor "FATAL: reload script missing; renewals will fail"
-  echo "$(date '+%Y-%m-%d %H:%M:%S') FATAL: reload script missing" >> /var/log/acme-xray-landing-renew.log 2>/dev/null || true
-  exit 1
-fi
 # 7天内过期则告警（logger + renew.log + profile.d SSH登录劫持）
 # 完全独立于 acme.sh 回调路径，防续期连续失败时系统静默
 # [v2.7 Gemini-Doc1-🔴] Also runs systemctl reset-failed on expiry detection:
@@ -1120,15 +1113,15 @@ sync_xray_config(){
     export _CFG_OUT="$LANDING_CONF"
     export _LANDING_PORT="$LANDING_PORT"
     export _VLESS_UUID="$VLESS_UUID"
-    # [R9 Fix] Validate BEFORE export — non-numeric values must die before Python inherits them
-    for _p in "$VLESS_GRPC_PORT" "$TROJAN_GRPC_PORT" "$VLESS_WS_PORT" "$TROJAN_TCP_PORT"; do
-      [[ "$_p" =~ ^[0-9]+$ ]] || die "内部端口 '$_p' 非数字（manager.conf 损坏），拒绝启动"
-    done
     export _VLESS_GRPC_PORT="$VLESS_GRPC_PORT"
     export _TROJAN_GRPC_PORT="$TROJAN_GRPC_PORT"
     export _VLESS_WS_PORT="$VLESS_WS_PORT"
     export _TROJAN_TCP_PORT="$TROJAN_TCP_PORT"
     export _BIND_IP="$BIND_IP"
+    [[ "$VLESS_GRPC_PORT" =~ ^[0-9]+$ ]] || die "VLESS_GRPC_PORT non-numeric: $VLESS_GRPC_PORT"
+    [[ "$TROJAN_GRPC_PORT" =~ ^[0-9]+$ ]] || die "TROJAN_GRPC_PORT non-numeric: $TROJAN_GRPC_PORT"
+    [[ "$VLESS_WS_PORT" =~ ^[0-9]+$ ]] || die "VLESS_WS_PORT non-numeric: $VLESS_WS_PORT"
+    [[ "$TROJAN_TCP_PORT" =~ ^[0-9]+$ ]] || die "TROJAN_TCP_PORT non-numeric: $TROJAN_TCP_PORT"
     python3 - <<'PYEOF'
 import json, os, glob, uuid as _uuid, random as _rand
 
@@ -1389,7 +1382,6 @@ User=@@LANDING_USER@@
 NoNewPrivileges=true
 ExecStartPre=/bin/sh -c 'test -f @@LANDING_CONF@@ || { echo "config.json missing"; exit 1; }'
 ExecStartPre=/bin/sh -c 'python3 -c "import json,sys; json.load(open(sys.argv[1]))" @@LANDING_CONF@@ 2>/dev/null || { echo "config.json invalid JSON"; exit 1; }'
-ExecStartPre=/bin/sh -c 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); vision=[i for i in d[\"inbounds\"] if \"flow\" in str(i.get(\"settings\",{}).get(\"clients\",[{}])[0])]; sys.exit(1 if any(\"mux\" in str(i) for i in vision) else 0)" @@LANDING_CONF@@ 2>/dev/null || { echo "Vision inbound has mux enabled (unsupported with flow=xtls-rprx-vision)"; exit 1; }'
 @@CAP_LINE@@
 @@CAP_BOUND@@
 ExecStart=@@LANDING_BIN@@ run -config @@LANDING_CONF@@
@@ -1604,9 +1596,8 @@ setup_firewall(){
     if [[ -z "$tip" ]]; then
       warn "  [跳过] 节点文件 ${meta} 缺少 TRANSIT_IP 字段"; (( ++skipped )) || true; continue
     fi
-    # [R16 Fix] Add 5s timeout to Python call — prevents indefinite hang if Python is broken
-    if ! printf '%s' "$tip" | timeout 5 python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null; then
-      warn "  [跳过] 节点文件 ${meta} TRANSIT_IP='${tip}' 格式非法或 Python 无响应"; (( ++skipped )) || true; continue
+    if ! printf '%s' "$tip" | python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null; then
+      warn "  [跳过] 节点文件 ${meta} TRANSIT_IP='${tip}' 格式非法"; (( ++skipped )) || true; continue
     fi
     tips+=("$tip")
   done
@@ -1696,8 +1687,7 @@ _persist_iptables(){
   while IFS= read -r meta; do
     [[ -f "$meta" ]] || continue
     local tip; tip=$(grep '^TRANSIT_IP=' "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || continue
-    # [R16 Fix] Add 5s timeout to Python call
-    printf '%s' "$tip" | timeout 5 python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null && transit_ips+=("$tip") || true
+    printf '%s' "$tip" | python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null && transit_ips+=("$tip") || true
   done < <(find "${MANAGER_BASE}/nodes" -name "*.conf" -not -name "tmp-*.conf" -type f 2>/dev/null | sort)
 
   local _fw_sig="LANDING_FW_VERSION=${VERSION}_$(date +%Y%m%d)"
@@ -2763,14 +2753,8 @@ purge_all(){
         [[ -n "$LANDING_USER" ]] && pgrep -u "$LANDING_USER" >/dev/null 2>&1 || break
         sleep 0.5
       done
-      # [R14 Fix] userdel -r may fail silently if home is on separate FS; explicitly clean up
-      local _home; _home=$(getent passwd "$LANDING_USER" 2>/dev/null | cut -d: -f6) || true
       if ! userdel -r "$LANDING_USER" 2>/dev/null; then
         warn "userdel 失败 (用户可能仍有运行中进程) — 需要手动清理"
-      fi
-      # Try to remove home directory even if userdel succeeded without -r
-      if [[ -n "$_home" && -d "$_home" ]]; then
-        rm -rf "$_home" 2>/dev/null || warn "无法删除用户 home 目录 $_home，请手动清理"
       fi
       groupdel "$LANDING_USER" 2>/dev/null || true
     fi
