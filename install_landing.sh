@@ -984,18 +984,20 @@ _wait_dns_txt(){
 # 移除之前错误引入的 nginx stop/start，避免每次申请证书都导致 45231 decoy 宕机
 rm -rf "${ACME_HOME}/${domain}_ecc" 2>/dev/null || true
 local issued=0
-for try in 1 2; do
+  # [CRITICAL-DNS Fix] REMOVED _wait_dns_txt pre-check: acme.sh --issue creates the TXT record
+  # internally, then waits for propagation and verifies itself. Pre-polling for a non-existent TXT
+  # before issuance always times out (120s wasted), defeating the purpose. Let acme.sh manage
+  # its own DNS propagation with its built-in --dnssleep mechanism.
+  for try in 1 2; do
     local _force_opt=""
     (( try > 1 )) && _force_opt="--force"
-    # [R2 Fix] Wait for DNS propagation BEFORE first issuance attempt (not just between retries)
-    # [R5 Partial Fix] Die on DNS timeout before first attempt — don't waste ACME attempts
-    (( try == 1 )) && ! _wait_dns_txt "$domain" && die "DNS TXT 记录在 120 秒内未传播，终止证书申请（请等待后重试）"
-    # [R2 Fix] Remove --dnssleep 0 — _wait_dns_txt already provides up to 120s of polling
-    # before each issuance attempt. Passing --dnssleep 0 on the retry attempt causes acme.sh
-    # to immediately re-validate without any buffer, hard-failing if DNS hasn't propagated yet.
+    info "申请证书（DNS-01/Cloudflare）: ${domain}，第 ${try} 次尝试..."
+    # acme.sh handles DNS TXT creation, propagation waiting, and verification internally.
+    # --dnssleep 0 = let acme.sh control timing (its default is ~10s polling interval).
     CF_Token="$cf_token" "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --issue --dns dns_cf \
       --domain "$domain" --keylength ec-256 \
       --server letsencrypt \
+      --dnssleep 0 \
       ${_force_opt} && issued=1 && break || true
     if (( try < 2 )); then
       warn "第 ${try} 次申请失败，等待 DNS 传播后重试..."
