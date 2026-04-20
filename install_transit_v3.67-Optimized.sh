@@ -197,6 +197,8 @@ detect_ssh_port(){
 validate_domain(){
   local d
   d="$(trim "$1")"
+  # [R22 Fix] Strip trailing dot (FQDN format) before validation
+  d="${d%.}"
   # RFC1035 长度守卫 + 必须含点
   (( ${#d} >= 4 && ${#d} <= 253 )) || die "域名长度非法 (${#d}): $d"
   [[ "$d" == *"."* ]] || die "域名必须包含至少一个点: $d"
