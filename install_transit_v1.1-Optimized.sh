@@ -512,6 +512,142 @@ install_nginx(){
   _tune_nginx_worker_connections
 }
 
+install_subscription_service(){
+  # [NEW] Transit subscription aggregator — Python HTTP service on 65432
+  # Feeds nginx port 80 proxy_pass for /xs endpoint
+  info "安装订阅聚合服务 ..."
+  mkdir -p /usr/local/bin /var/log
+
+  cat > /usr/local/bin/transit-sub-agg.py << 'PYEOF'
+#!/usr/bin/env python3
+import http.server, base64, json, os, signal
+
+META_DIR = '/etc/transit_manager/conf'
+PORT = 65432
+
+def get(meta, key, default=''):
+    for k in [key, key.upper(), key.lower()]:
+        if k in meta:
+            return meta[k].strip()
+    return default
+
+def gen_sub(meta):
+    # BUGFIX #21: 服务器地址用 TRANSIT_IP（中转机IP），域名只做SNI
+    # 原因：域名绑定假IP，客户端如果用域名连接会失败
+    domain    = get(meta, 'DOMAIN')
+    transit  = get(meta, 'TRANSIT_IP')   # 中转机IP，客户端实际连接地址
+    uuid     = get(meta, 'UUID')
+    pwd      = get(meta, 'PWD')
+    pwd2     = get(meta, 'PWD2') or pwd
+    pfx      = get(meta, 'PFX')
+    if not all([domain, transit, uuid, pwd, pfx]):
+        return ''
+    nodes = []
+    # Trojan: 服务器=中转机IP，SNI=域名
+    trojan = 'trojan://{p}@{s}:443?allowInsecure=1&peer={d}&sni={d}#Trojan-WS'.format(p=pwd, s=transit, d=domain)
+    nodes.append(trojan)
+    # VLESS gRPC: 服务器=中转机IP，SNI=域名
+    vg = 'vless://{u}@{s}:443?encryption=none&flow=grpc&serviceName=grpc&type=grpc&host={d}&sni={d}#VLESS-gRPC'.format(u=uuid, s=transit, d=domain)
+    nodes.append(vg)
+    # VLESS WS: 服务器=中转机IP，SNI=域名
+    ws_path = pfx + '-' + uuid[:8]
+    vw = 'vless://{u}@{s}:443?encryption=none&path=/{p}&host={d}&type=ws&sni={d}#VLESS-WS'.format(u=uuid, s=transit, d=domain, p=ws_path)
+    nodes.append(vw)
+    # VMess TCP: 服务器=中转机IP，SNI=域名
+    vmess_cfg = json.dumps({'v':'2','ps':'VMess-TCP','add':transit,'port':'443','id':uuid,'aid':'0','net':'tcp','type':'none','host':domain,'tls':'tls','sni':domain}, separators=(',',':'))
+    vmess_b64 = base64.b64encode(vmess_cfg.encode()).decode().replace('=','')
+    nodes.append('vmess://' + vmess_b64 + '#VMess-TCP')
+    # Shadowsocks 2022: 服务器=中转机IP
+    ss_b64 = base64.b64encode((pwd2 + '@chacha20-ietf-poly1305').encode()).decode().replace('=','')
+    nodes.append('ss://' + ss_b64 + '@' + transit + ':443#SS-2022')
+    return '\n'.join(nodes) + '\n'
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ('/xs', '/'):
+            metas = []
+            if os.path.isdir(META_DIR):
+                for fn in sorted(os.listdir(META_DIR)):
+                    if fn.endswith('.meta'):
+                        m = {}
+                        with open(os.path.join(META_DIR, fn)) as fp:
+                            for line in fp:
+                                if '=' in line:
+                                    k, v = line.strip().split('=',1)
+                                    m[k] = v.strip()
+                        if m: metas.append(m)
+            merged = ''.join(gen_sub(m) for m in metas)
+            b64 = base64.b64encode(merged.encode()).decode().replace('=','')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(b64.encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+    def log_message(self, fmt, *args): pass
+
+signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
+s = http.server.HTTPServer(('', PORT), Handler)
+s.serve_forever()
+PYEOF
+
+  chmod +x /usr/local/bin/transit-sub-agg.py
+
+  cat > /etc/systemd/system/transit-sub.service << 'SVCEOF'
+[Unit]
+Description=Transit Subscription Aggregator
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/transit-sub-agg.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+  systemctl daemon-reload
+  systemctl enable transit-sub 2>/dev/null || true
+  systemctl restart transit-sub 2>/dev/null || true
+  success "订阅聚合服务已启动 (transit-sub, port 65432)"
+}
+
+write_nginx_subscription_config(){
+  # Write nginx HTTP subscription endpoint (/xs via proxy_pass to 65432)
+  # and ensure default site does not conflict on port 80
+  info "写入 Nginx 订阅端点配置 ..."
+
+  # Remove default site to avoid 'default_server' port 80 conflict
+  rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+
+  cat > /etc/nginx/conf.d/transit-sub.conf << 'NGXEOF'
+# transit-sub.conf — 订阅端点，由 install_transit_${VERSION}.sh 管理
+server {
+    listen 80;
+    server_name _;
+    location = /xs {
+        proxy_pass http://127.0.0.1:65432;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        access_log off;
+    }
+    location / {
+        return 444;
+    }
+}
+NGXEOF
+
+  nginx -t 2>/dev/null || { warn "nginx 订阅配置验证失败"; return 1; }
+  systemctl reload nginx 2>/dev/null || true
+  success "Nginx 订阅端点已配置 (http://transit-ip/xs)"
+}
+
 _tune_nginx_worker_connections(){
   local mc="$NGINX_MAIN_CONF"
   # [F4] Snapshot before sed mutations so nginx.conf can be restored on nginx -t failure
@@ -1149,10 +1285,11 @@ _atomic_apply_route(){
   }
   trap '_route_rollback; _restore_prev_route_traps; exit 1' INT TERM ERR
   local domain="$1" ip="$2" port="$3"
-  local uuid="${4:-}" pwd="${5:-}" pfx="${6:-}"
+  local uuid="${4:-}" pwd="${5:-}" pfx="${6:-}" transit_ip="${7:-}"
   # [R3 Fix] Validate uuid/pwd/pfx are non-empty for token-import mode
   # v3.64: Manual add_landing_route passes empty strings — skip validation, allow partial route
   #        Token import path (import_token) always provides all 6 params so this still validates
+  # BUGFIX #21: transit_ip param added for correct subscription URL server address
   if [[ -z "$uuid" || -z "$pwd" || -z "$pfx" ]]; then
     : # manual mode — uuid/pwd/pfx may be absent, only write routing (no subscription)
   else
@@ -1243,7 +1380,7 @@ _atomic_apply_route(){
   local tmp_meta; tmp_meta=$(mktemp "${CONF_DIR}/.snap-recover.XXXXXX") \
     || die "mktemp tmp_meta failed"
   printf 'DOMAIN=%s\nTRANSIT_IP=%s\nPORT=%s\nUUID=%s\nPWD=%s\nPFX=%s\nCREATED=%s\n' \
-    "$domain" "$ip" "$port" "$uuid" "$pwd" "$pfx" "$(date +%Y%m%d_%H%M%S)" > "$tmp_meta" \
+    "$domain" "$transit_ip" "$port" "$uuid" "$pwd" "$pfx" "$(date +%Y%m%d_%H%M%S)" > "$tmp_meta" \
     || { rm -f "$tmp_meta" 2>/dev/null; die "写入 meta 临时文件失败（磁盘满？）"; }
   chmod 600 "$tmp_meta" \
     || { rm -f "$tmp_meta" 2>/dev/null; die "chmod tmp_meta failed"; }
@@ -1456,7 +1593,7 @@ print(decoded)
     }
     trap '_import_install_rollback' ERR INT TERM
 
-    optimize_kernel_network; install_nginx; init_nginx_stream; setup_firewall_transit
+    optimize_kernel_network; install_nginx; init_nginx_stream; install_subscription_service; write_nginx_subscription_config; setup_firewall_transit
     write_logrotate
     # [F2] nginx enable must be durable — silent failure means decoy dies on next reboot
     systemctl enable nginx || die "nginx enable failed — decoy will not survive reboot"
@@ -1470,7 +1607,9 @@ print(decoded)
   fi
 
   # ARCH-2: 传入 uuid/pwd/pfx，meta 中持久化；generate_nodes() 读取后生成完整订阅
-  _atomic_apply_route "$dom" "$ip" "$port" "$uuid" "$pwd" "$pfx" || die "Route application failed"
+  # BUGFIX #21: 第7参数传入中转机公网IP，用于订阅URL服务器地址
+  local _transit_ip; _transit_ip=$(get_public_ip)
+  _atomic_apply_route "$dom" "$ip" "$port" "$uuid" "$pwd" "$pfx" "$_transit_ip" || die "Route application failed"
   # [BUGFIX #13] Create .installed DURING import_token, not after.
   # This ensures the flag exists on disk even if subsequent steps trigger ERR/EXIT traps.
   mkdir -p "${MANAGER_BASE}" 2>/dev/null || true
@@ -1535,7 +1674,7 @@ add_landing_route(){
 
   # v2.35 Grok: _atomic_apply_route 内部自管快照，外部 _old_bak 仍保留供 SIGINT 清理
   # v3.64: 手动模式不传 uuid/pwd/pfx，_atomic_apply_route 允许空值（仅写路由，无节点订阅）
-  _atomic_apply_route "$LANDING_DOMAIN" "$LANDING_IP" "$LANDING_PORT_IN" "" "" ""
+  _atomic_apply_route "$LANDING_DOMAIN" "$LANDING_IP" "$LANDING_PORT_IN" "" "" "" ""
   rm -f "$_old_bak" 2>/dev/null || true
   _release_lock
   success "路由规则已生效: SNI=${LANDING_DOMAIN} → ${LANDING_IP}:${LANDING_PORT_IN}"
@@ -1787,6 +1926,10 @@ _purge_bulldoze6(){
   rm -f "$LOGROTATE_FILE" 2>/dev/null || true
   # v2.32 Gemini: 卸载时清除日志目录，防止重装后僵尸日志污染
   rm -rf "$LOG_DIR" 2>/dev/null || true
+  # [BUGFIX #22] Clean up subscription service artifacts
+  rm -f /usr/local/bin/transit-sub-agg.py 2>/dev/null || true
+  rm -f /var/log/transit-sub.log 2>/dev/null || true
+  rm -f /var/run/transit-sub.pid 2>/dev/null || true
   rm -rf "$MANAGER_BASE"
   # 卸载后验收
   local _clean=1
@@ -1863,8 +2006,15 @@ fresh_install(){
   echo -e "  ${GREEN}④${NC} iptables: 仅开放 SSH + TCP 443 + ICMP，其余 DROP（动态双栈守卫）"
   echo -e "  ${GREEN}⑤${NC} 录入第一台落地机配对信息"
   echo ""
-  read -rp "确认开始安装？[y/N]: " CONFIRM
-  [[ "$CONFIRM" =~ ^[Yy]$ ]] || { info "已取消"; exit 0; }
+  # [BUGFIX #17] --import mode (SSH non-interactive): skip confirmation prompt.
+  # Without a TTY, `read -rp` returns non-zero → `set -e` causes immediate exit.
+  if [[ "${__TRANSIT_IMPORT_MODE:-0}" == "1" ]]; then
+    info "[自动模式] 跳过确认，5秒后继续安装..."
+    sleep 5
+  else
+    read -rp "确认开始安装？[y/N]: " CONFIRM
+    [[ "$CONFIRM" =~ ^[Yy]$ ]] || { info "已取消"; exit 0; }
+  fi
 
   # FW-2 FIX: 半安装死锁：防火墙配置中断后 nginx 仍占用 443，重试时 die 导致无限死锁
   # 判断逻辑：
@@ -1898,6 +2048,12 @@ fresh_install(){
   __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
   trap '_fresh_install_rollback' ERR INT TERM
   init_nginx_stream
+  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
+  trap '_fresh_install_rollback' ERR INT TERM
+  install_subscription_service
+  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
+  trap '_fresh_install_rollback' ERR INT TERM
+  write_nginx_subscription_config
   __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
   trap '_fresh_install_rollback' ERR INT TERM
   setup_firewall_transit
