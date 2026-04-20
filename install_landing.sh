@@ -946,7 +946,9 @@ issue_certificate(){
     [[ -f "${ACME_HOME}/acme.sh" ]]       || die "acme.sh 安装后在 ${ACME_HOME} 未找到 acme.sh，请检查安装器是否支持 --home"
     [[ -f "${ACME_HOME}/dnsapi/dns_cf.sh" ]]       || die "acme.sh 安装后缺少 dns_cf.sh 插件，请检查: ls ${ACME_HOME}/dnsapi/"
     env ACME_HOME="${ACME_HOME}" "${ACME_HOME}/acme.sh"       --set-default-ca --server letsencrypt 2>/dev/null       || warn "set-default-ca letsencrypt 失败（acme.sh 版本过旧？），将使用默认 CA，建议升级 acme.sh"
-    "${ACME_HOME}/acme.sh" --upgrade --auto-upgrade 2>/dev/null || true
+    # [CRITICAL-acme Fix] REMOVED --upgrade --auto-upgrade: acme.sh's auto-upgrade downloads
+    # master.tar.gz and re-runs install, which overwrites /etc/xray-landing/acme with a fresh
+    # install to /root/.acme.sh. Let the system's package manager handle upgrades.
   fi
   export PATH="${ACME_HOME}:${PATH}"
 
