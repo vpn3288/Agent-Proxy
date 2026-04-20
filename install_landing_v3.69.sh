@@ -1401,7 +1401,6 @@ ExecStartPre=/bin/sh -c 'python3 -c "import json,sys; d=json.load(open(sys.argv[
 ExecStart=@@LANDING_BIN@@ run -config @@LANDING_CONF@@
 Environment=XRAY_LOCATION_ASSET=/usr/local/share/xray-landing
 Restart=on-failure
-ExecReload=/bin/systemctl restart xray-landing.service
 # [Fix-C] RestartSec=15s: slower retry reduces cert-reload thundering-herd; 10×15s=150s < 900s window
 RestartSec=15s
 LimitNOFILE=@@LIMIT_NOFILE@@
@@ -1677,6 +1676,11 @@ setup_firewall(){
     ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type packet-too-big -m comment --comment "xray-landing-icmp6-pmtud" -j ACCEPT
     ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type time-exceeded -m comment --comment "xray-landing-icmp6" -j ACCEPT
     ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type parameter-problem -m comment --comment "xray-landing-icmp6" -j ACCEPT
+    # NDP: router-solicitation, router-advertisement, neighbor-solicitation, neighbor-advertisement
+    ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type 133 -m comment --comment "xray-landing-icmp6-ndp" -j ACCEPT
+    ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type 134 -m comment --comment "xray-landing-icmp6-ndp" -j ACCEPT
+    ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type 135 -m comment --comment "xray-landing-icmp6-ndp" -j ACCEPT
+    ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type 136 -m comment --comment "xray-landing-icmp6-ndp" -j ACCEPT
     ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type echo-request -m limit --limit 10/second --limit-burst 20 -m comment --comment "xray-landing-icmp6" -j ACCEPT
     ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type echo-request -m comment --comment "xray-landing-icmp6-drop" -j DROP
     ip6tables -w 2 -A "$FW_TMP6" -p tcp      --dport "$LANDING_PORT" -j DROP
@@ -1790,6 +1794,10 @@ if [ -f /proc/net/if_inet6 ] && command -v ip6tables >/dev/null 2>&1 && ip6table
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -i lo -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp      --dport ${SSH_PORT}      -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type 133 -m comment --comment 'xray-landing-icmp6-ndp' -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type 134 -m comment --comment 'xray-landing-icmp6-ndp' -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type 135 -m comment --comment 'xray-landing-icmp6-ndp' -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type 136 -m comment --comment 'xray-landing-icmp6-ndp' -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type echo-request -m limit --limit 10/second --limit-burst 20 -m comment --comment 'xray-landing-icmp6' -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type echo-request -m comment --comment 'xray-landing-icmp6-drop' -j DROP
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -j DROP
@@ -2756,6 +2764,7 @@ purge_all(){
   systemctl restart systemd-journald 2>/dev/null || true
   rm -rf "$MANAGER_BASE" 2>/dev/null || true
   rm -f /etc/sysctl.d/99-landing-bbr.conf /etc/modprobe.d/99-landing-conntrack.conf 2>/dev/null || true
+  sysctl --system &>/dev/null || true
   rm -f /etc/cron.daily/xray-cert-monitor 2>/dev/null || true
   if [[ -f /etc/cron.daily/xray-cert-monitor ]]; then
     warn "无法删除 /etc/cron.daily/xray-cert-monitor（可能是只读文件系统），请手动删除"

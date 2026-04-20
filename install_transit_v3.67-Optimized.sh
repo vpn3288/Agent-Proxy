@@ -523,7 +523,8 @@ _tune_nginx_worker_connections(){
   (( _wc_ram < 10000 )) && _wc_ram=10000
   (( _wc_ram > 200000 )) && _wc_ram=200000
   local _wc_val=$(( _wc_ram / $(nproc 2>/dev/null || echo 1) ))
-  local _wc_escaped; _wc_escaped=$(printf '%s' "$VERSION" | sed 's/[.\-]/\&/g')
+  local _wc_escaped="${VERSION//./\\.}"
+  _wc_escaped="${_wc_escaped//-/\-}"
   grep -qE "^[[:space:]]*worker_connections[[:space:]]+${_wc_val}[[:space:]]*;[[:space:]]*# transit-manager-tuning-v${_wc_escaped}$" "$mc" 2>/dev/null || {
     _mc_dirty=1
     if grep -qE '^[[:space:]]*worker_connections' "$mc" 2>/dev/null; then
@@ -1468,7 +1469,7 @@ print(decoded)
     if command -v mack-a &>/dev/null || [[ -f /etc/v2ray-agent/install.sh ]]; then
       warn "检测到 mack-a 已安装，请先停止 mack-a 服务后再安装本脚本"
     fi
-    ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/ {print; exit 0}' && die "443 端口已被占用！请先停止冲突服务后再安装（建议先执行 systemctl stop nginx xray* mack-a*）"
+    ss -tlnp 2>/dev/null | grep -q ":443 " && die "443 端口已被占用！请先停止冲突服务后再安装（建议先执行 systemctl stop nginx xray* mack-a*）"
 
     # [v2.8 GPT-Doc2-🔴] Trap registered BEFORE the first side-effect write (check_deps).
     # v2.7 registered it after the 443 check but before check_deps; if apt-get update failed
@@ -1899,7 +1900,7 @@ fresh_install(){
   # 判断逻辑：
   #   ① nginx 占 443 + stream include 存在 → 本脚本半装，stop nginx 后继续重装
   #   ② 其他进程占 443 → 真正冲突，die 要求用户手动处理
-  if ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/ {exit 0} END {exit 1}' 2>/dev/null; then
+  if ss -tlnp 2>/dev/null | grep -q ":443 "; then
     if command -v mack-a &>/dev/null || [[ -f /etc/v2ray-agent/install.sh ]]; then
       warn "检测到 mack-a 已安装，请先停止 mack-a 服务后再安装本脚本"
     fi
@@ -1910,7 +1911,7 @@ fresh_install(){
       systemctl stop nginx 2>/dev/null || nginx -s stop 2>/dev/null || true
       sleep 1
       # 再次确认 443 已释放
-      if ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/ {exit 0} END {exit 1}' 2>/dev/null; then
+      if ss -tlnp 2>/dev/null | grep -q ":443 "; then
         die "nginx 停止后 443 仍被占用（可能有其他进程），请手动执行: ss -tlnp | awk '\$4 ~ /:443\$/ {print}'"
       fi
       info "443 端口已释放，继续安装..."
